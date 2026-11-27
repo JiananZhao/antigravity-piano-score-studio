@@ -14,6 +14,7 @@ import soundfile as sf
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tempo_map import TempoMap, load_tempo_map
+from style_analyzer import load_style_profile, scale_pcs_from_key_fifths
 
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 PC_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
@@ -230,6 +231,8 @@ def main() -> None:
     ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--midi", default=None, help="Optional input MIDI path (required when using --clean-midi)")
     ap.add_argument("--clean-midi", default=None, help="Optional output path to write MIDI with confirmed ghost notes removed")
+    ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID (e.g. jazz_groove)")
+    ap.add_argument("--key-fifths", type=int, default=None, help="Optional key signature fifths (-7..+7) for diatonic scale check")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -240,8 +243,17 @@ def main() -> None:
     tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, eff_bt, args.first_downbeat)
     notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, beat_type=args.beat_type, tempo_map=tmap)
 
-    pcs = np.bincount([n["midi"] % 12 for n in notes], minlength=12)
-    scale_pcs = set(np.argsort(pcs)[-7:].tolist())
+    profile = load_style_profile(args.style_profile) if args.style_profile else None
+    pa_cfg = (profile or {}).get("pitch_audit", {})
+    ghost_f0_gap_db = float(pa_cfg.get("ghost_f0_gap_db", 12.0))
+    ghost_og_db = float(pa_cfg.get("ghost_og_db", 3.0))
+    weak_oos_snr_db = float(pa_cfg.get("weak_oos_snr_db", 12.0))
+
+    if args.key_fifths is not None:
+        scale_pcs = scale_pcs_from_key_fifths(args.key_fifths)
+    else:
+        pcs = np.bincount([n["midi"] % 12 for n in notes], minlength=12)
+        scale_pcs = set(np.argsort(pcs)[-7:].tolist())
 
     # Group by quantized 40ms onset buckets to detect minor-2nd clashes
     by_bucket: dict[int, list[dict]] = {}
@@ -260,7 +272,7 @@ def main() -> None:
                     a, b = grp_s[i], grp_s[j]
                     weaker, stronger = (a, b) if a["f0_db"] < b["f0_db"] else (b, a)
                     gap_db = stronger["f0_db"] - weaker["f0_db"]
-                    is_ghost = gap_db > 12.0 or weaker["og_db"] < 3.0
+                    is_ghost = gap_db > ghost_f0_gap_db or weaker["og_db"] < ghost_og_db
                     item = {
                         "measure": weaker["measure"],
                         "beat": weaker["beat"],
@@ -277,8 +289,8 @@ def main() -> None:
                         confirmed_ghosts.append(item)
 
     oos_notes = [n for n in notes if (n["midi"] % 12) not in scale_pcs]
-    weak_oos = [n for n in oos_notes if n["snr_db"] < 12.0 or n["og_db"] < 3.0]
-    low_og_lh = [n for n in notes if n["staff"] == 2 and n["og_db"] < 3.0]
+    weak_oos = [n for n in oos_notes if n["snr_db"] < weak_oos_snr_db or n["og_db"] < ghost_og_db]
+    low_og_lh = [n for n in notes if n["staff"] == 2 and n["og_db"] < ghost_og_db]
 
     removed_ghosts = 0
     cleaned_midi_str = None
@@ -291,6 +303,8 @@ def main() -> None:
 
     report = {
         "stage": "stage_2_transcription_pitch_audit",
+        "style_profile": (profile or {}).get("profile_id", "default"),
+        "thresholds": {"ghost_f0_gap_db": ghost_f0_gap_db, "ghost_og_db": ghost_og_db, "weak_oos_snr_db": weak_oos_snr_db},
         "total_onsets": len(notes),
         "detected_scale_pcs": sorted(PC_NAMES[c] for c in scale_pcs),
         "minor2nd_clashes": clashes,
