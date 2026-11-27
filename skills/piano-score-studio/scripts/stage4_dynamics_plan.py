@@ -12,6 +12,10 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tempo_map import load_tempo_map
+
 
 def suggest_dynamic(db: float, p15: float, p40: float, p70: float, p90: float) -> str:
     if db <= p15:
@@ -33,7 +37,9 @@ def main() -> None:
     ap.add_argument("--audio", required=True)
     ap.add_argument("--bpm", type=float, required=True)
     ap.add_argument("--beats-per-bar", type=int, required=True)
+    ap.add_argument("--beat-type", type=int, default=4, choices=(4, 8), help="Time signature denominator (4 or 8)")
     ap.add_argument("--first-downbeat", type=float, required=True)
+    ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--num-bars", type=int, required=True, help="Count of full bars 1..N")
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
@@ -52,11 +58,10 @@ def main() -> None:
     bands = [(20, 150), (150, 500), (500, 2000), (2000, 8000), (8000, 20000)]
     band_pcts = [round(float(np.sum(np.abs(fft_full[(freqs >= lo) & (freqs < hi)]) ** 2) / tot_e * 100.0), 2) for lo, hi in bands]
 
-    bar_s = args.beats_per_bar * (60.0 / args.bpm)
+    tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, args.beat_type, args.first_downbeat)
     rows = []
     for b in range(1, args.num_bars + 1):
-        t0 = args.first_downbeat + (b - 1) * bar_s
-        t1 = t0 + bar_s
+        t0, t1 = tmap.bar_bounds_sec(b)
         i0, i1 = max(0, int(t0 * sr)), min(len(mono), int(t1 * sr))
         if i1 <= i0:
             full_db, lh_db, rh_db = -60.0, -60.0, -60.0
@@ -107,7 +112,7 @@ def main() -> None:
     plan_md = f"""# 力度分析与标记工作计划（Dynamics Plan）
 
 - **参考原音**：`{args.audio}`
-- **速度与拍号**：`{args.bpm} BPM`，`{args.beats_per_bar}/4`，首强拍 `{args.first_downbeat}s`，共 `{args.num_bars}` 小节
+- **速度与拍号**：`{args.bpm} BPM`（`{tmap.mode}`），`{args.beats_per_bar}/{args.beat_type}`，首强拍 `{args.first_downbeat}s`，共 `{args.num_bars}` 小节
 - **立体声 Side/Mid 比**：`{sm_ratio:.3f}`
 - **5 频段能量分布（20-150 / 150-500 / 500-2k / 2k-8k / 8k-20k Hz）**：`{band_pcts}`
 

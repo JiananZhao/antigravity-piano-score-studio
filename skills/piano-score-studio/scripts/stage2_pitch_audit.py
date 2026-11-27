@@ -11,6 +11,10 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tempo_map import TempoMap, load_tempo_map
+
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 PC_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
@@ -21,6 +25,7 @@ def parse_xml_onsets(
     beats_per_bar: int,
     first_downbeat: float,
     beat_type: int | None = None,
+    tempo_map: TempoMap | None = None,
 ) -> list[dict]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -31,6 +36,7 @@ def parse_xml_onsets(
     quarter_s = beat_s * (eff_beat_type / 4.0)
     unit_s = quarter_s / float(divisions)
     beat_units = max(1e-9, (divisions * 4.0) / float(eff_beat_type))
+    bar_units = (beats_per_bar * divisions * 4) // eff_beat_type
     bar_s = beats_per_bar * beat_s
 
     notes = []
@@ -64,15 +70,23 @@ def parse_xml_onsets(
                 staff = int(el.findtext("staff", "1"))
                 m_items.append((on, dur, midi, staff))
 
+        bar_slot_rel_bar1 = (-max_end) if (b == 0 and implicit) else ((b - 1) * bar_units)
         t_bar_start = (first_downbeat - max_end * unit_s) if (b == 0 and implicit) else (first_downbeat + (b - 1) * bar_s)
         for on, dur, midi, staff in m_items:
             beat_on = on / beat_units
+            if tempo_map is not None and tempo_map.is_rubato:
+                t_on = tempo_map.slot_to_sec(bar_slot_rel_bar1 + on, divisions)
+                t_off = tempo_map.slot_to_sec(bar_slot_rel_bar1 + on + dur, divisions)
+                dur_s = max(0.01, t_off - t_on)
+            else:
+                t_on = t_bar_start + on * unit_s
+                dur_s = dur * unit_s
             notes.append(
                 {
                     "measure": b,
                     "beat": round(beat_on + 1.0, 2),
-                    "t_on": t_bar_start + on * unit_s,
-                    "dur_s": dur * unit_s,
+                    "t_on": t_on,
+                    "dur_s": dur_s,
                     "midi": midi,
                     "name": f"{PC_NAMES[midi % 12]}{midi // 12 - 1}",
                     "staff": staff,
@@ -213,6 +227,7 @@ def main() -> None:
     ap.add_argument("--beats-per-bar", type=int, required=True)
     ap.add_argument("--beat-type", type=int, default=None, choices=(4, 8), help="Optional denominator override (defaults to XML beat-type)")
     ap.add_argument("--first-downbeat", type=float, required=True)
+    ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--midi", default=None, help="Optional input MIDI path (required when using --clean-midi)")
     ap.add_argument("--clean-midi", default=None, help="Optional output path to write MIDI with confirmed ghost notes removed")
     ap.add_argument("--out", required=True)
@@ -220,7 +235,10 @@ def main() -> None:
 
     data, sr = sf.read(args.audio, dtype="float64", always_2d=True)
     mono = data.mean(axis=1)
-    notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, beat_type=args.beat_type)
+    xml_root = ET.parse(args.xml).getroot()
+    eff_bt = args.beat_type if args.beat_type is not None else int(xml_root.findtext(".//attributes/time/beat-type", "4"))
+    tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, eff_bt, args.first_downbeat)
+    notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, beat_type=args.beat_type, tempo_map=tmap)
 
     pcs = np.bincount([n["midi"] % 12 for n in notes], minlength=12)
     scale_pcs = set(np.argsort(pcs)[-7:].tolist())
