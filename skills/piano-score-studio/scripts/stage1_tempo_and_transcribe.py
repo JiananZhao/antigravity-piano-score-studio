@@ -954,6 +954,14 @@ def main() -> None:
             "bpm_candidates": bpm_info["candidates"],
             "meter_scores": meter_info["meter_scores"],
         },
+        "tempo_map": {
+            "mode": bpm_info["tempo_mode"],
+            "first_downbeat": first_downbeat,
+            "quarter_bpm": round(quarter_bpm, 3),
+            "beats_per_bar": sel_bpb,
+            "beat_type": sel_btype,
+            "quarter_beats": [round(float(t), 4) for t in quarter_beats],
+        },
         "outputs": {},
     }
 
@@ -997,6 +1005,7 @@ def main() -> None:
             report["outputs"]["score_musicxml"] = str(xml_path)
 
     final_grid = report["calibration"]["grid"]
+    cal_path = out_dir / "stage1_calibration.json"
     baseline_xml = out_dir / "score.musicxml"
     baseline_mid = out_dir / "score.mid"
     pitch_audit_out = out_dir.parent / "analysis" / "pitch_audit.json"
@@ -1006,19 +1015,19 @@ def main() -> None:
         "stage2_pitch_audit": (
             f'python skills/piano-score-studio/scripts/stage2_pitch_audit.py '
             f'--audio "{audio_path}" --xml "{baseline_xml}" '
-            f'--bpm {sel_bpm} --beats-per-bar {sel_bpb} --first-downbeat {first_downbeat} '
+            f'--bpm {sel_bpm} --beats-per-bar {sel_bpb} --beat-type {sel_btype} '
+            f'--first-downbeat {first_downbeat} --stage1-cal "{cal_path}" '
             f'--out "{pitch_audit_out}"'
         ),
         "stage3_engrave": (
             f'python skills/piano-score-studio/scripts/stage3_engrave_study_score.py '
             f'--midi "{baseline_mid}" --audio "{audio_path}" '
             f'--bpm {sel_bpm} --beats-per-bar {sel_bpb} --beat-type {sel_btype} '
-            f'--grid {final_grid} --first-downbeat {first_downbeat} '
+            f'--grid {final_grid} --first-downbeat {first_downbeat} --stage1-cal "{cal_path}" '
             f'--out-xml "{study_xml}" --out-pdf "{study_pdf}"'
         ),
     }
 
-    cal_path = out_dir / "stage1_calibration.json"
     cal_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
         f"Stage 1 Complete: BPM={sel_bpm} ({sel_bpb}/{sel_btype}), downbeat={first_downbeat:.3f}s, "
