@@ -1,0 +1,45 @@
+{
+  "profile_id": "baroque_polyphonic",
+  "display_name": "Baroque / Bach Polyphonic Counterpoint",
+  "description": "Independent multi-voice counterpoint, steady motoric 16th-note pulse, dry articulation (minimal pedal), balanced LH/RH prominence.",
+  "transcription": {
+    "default_grid": 4,
+    "tempo_mode_preference": "fixed-tempo",
+    "allow_swing": false
+  },
+  "pitch_audit": {
+    "ghost_f0_gap_db": 13.0,
+    "ghost_og_db": 2.5,
+    "weak_oos_snr_db": 11.5,
+    "allow_chromatic_clusters": false
+  },
+  "engraving": {
+    "split_center": 60.0,
+    "lh_max_pitch": 67,
+    "rh_min_pitch": 55,
+    "max_hand_span": 12,
+    "enable_gap_bridging": false,
+    "bridge_rms_db": -22.0,
+    "anchor_min_dur_beats": 1.0,
+    "max_voices_per_hand": 2
+  },
+  "dynamics": {
+    "pedal_style": "dry_articulated",
+    "target_rh_lh_diff_db": 0.5,
+    "lh_ceiling_vel": 105
+  },
+  "eval_rubric": {
+    "s1_min_circular_r_pass": 0.65,
+    "s1_max_drift_ms_pass": 35.0,
+    "s1_require_downbeat_peak": false,
+    "s1_spurious_16_pass_pct": 25.0,
+    "s1_spurious_16_warn_pct": 45.0,
+    "s3_max_spurious_16_pass": 40,
+    "s3_max_spurious_16_warn": 100,
+    "s3_max_rests_per_bar_pass": 4.0,
+    "s3_max_rests_per_bar_warn": 6.5,
+    "s3_max_mid_clef_changes_pass": 2,
+    "s4_max_lh_vel_pass": 108,
+    "s4_min_rh_lh_diff_pass": -2
+  }
+}

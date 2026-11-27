@@ -16,6 +16,7 @@ import soundfile as sf
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tempo_map import load_tempo_map
+from style_analyzer import load_style_profile
 
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 
@@ -90,11 +91,20 @@ def evaluate_s4_r1_static_dynamics(
     lh_med: float,
     lh_max: int,
     unclosed_wedges: int,
+    eval_rubric: dict | None = None,
 ) -> str:
-    """Evaluate s4_r1_static_dynamics against eval_rubric_v2.json PASS/WARN/FAIL bands."""
+    """Evaluate s4_r1_static_dynamics against eval_rubric_v2.json or v3.0 dynamic style profile rubric."""
     if placeholder_only or unclosed_wedges != 0:
         return "FAIL"
     diff = rh_med - lh_med
+    if eval_rubric:
+        min_diff_pass = float(eval_rubric.get("s4_min_rh_lh_diff_pass", 10.0))
+        max_lh_pass = int(eval_rubric.get("s4_max_lh_vel_pass", 90))
+        if diff >= min_diff_pass and lh_max <= max_lh_pass:
+            return "PASS"
+        if diff >= (min_diff_pass - 5.0) and lh_max <= (max_lh_pass + 10):
+            return "WARN"
+        return "FAIL"
     if diff >= 15.0 and lh_max <= 78:
         return "PASS"
     if diff >= 10.0 and lh_max <= 88:
@@ -122,6 +132,7 @@ def main() -> None:
     ap.add_argument("--beats-per-bar", type=int, required=True)
     ap.add_argument("--first-downbeat", type=float, required=True)
     ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json")
+    ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID for dynamic rubric thresholds")
     ap.add_argument("--pdf-visually-inspected", action="store_true")
     ap.add_argument("--rubato-verified", action="store_true")
     ap.add_argument("--out", required=True)
@@ -278,18 +289,39 @@ def main() -> None:
     med_lh_err = float(np.median(lh_errs))
     med_rh_err = float(np.median(rh_errs))
 
-    # Real Stage 1 tempo & downbeat checks (replacing hardcoded PASS)
+    profile = load_style_profile(args.style_profile) if args.style_profile else None
+    dyn_rubric = (profile or {}).get("eval_rubric")
+    s1_min_r = float((dyn_rubric or {}).get("s1_min_circular_r_pass", 0.70))
+    s1_max_drift = float((dyn_rubric or {}).get("s1_max_drift_ms_pass", 30.0))
+    s1_req_db_peak = bool((dyn_rubric or {}).get("s1_require_downbeat_peak", True))
+    s1_sp16_pass = float((dyn_rubric or {}).get("s1_spurious_16_pass_pct", 2.0))
+    s1_sp16_warn = float((dyn_rubric or {}).get("s1_spurious_16_warn_pct", 8.0))
+    s3_sp16_pass = int((dyn_rubric or {}).get("s3_max_spurious_16_pass", 0))
+    s3_sp16_warn = int((dyn_rubric or {}).get("s3_max_spurious_16_warn", 5))
+    s3_clef_pass = int((dyn_rubric or {}).get("s3_max_mid_clef_changes_pass", 0))
+    n_measures_total = max(1, len(measures))
+    rests_per_bar = visible_rests / n_measures_total
+    if dyn_rubric:
+        rpb_pass = float(dyn_rubric.get("s3_max_rests_per_bar_pass", 2.5))
+        rpb_warn = float(dyn_rubric.get("s3_max_rests_per_bar_warn", 4.0))
+        s3_rests_status = "PASS" if (dur_errors == 0 and rests_per_bar <= rpb_pass) else ("WARN" if dur_errors == 0 and rests_per_bar <= rpb_warn else "FAIL")
+    else:
+        s3_rests_status = "PASS" if (dur_errors == 0 and visible_rests <= 100) else ("WARN" if dur_errors == 0 and visible_rests <= 160 else "FAIL")
+
+    # Real Stage 1 tempo & downbeat checks (profile-aware)
     r_val, max_drift_ms = measure_tempo_lock(m_o, sr_o, args.bpm, args.first_downbeat)
     rubato_ok = bool(args.rubato_verified) or tmap.is_rubato
-    if r_val >= 0.70 and max_drift_ms <= 30.0:
+    if r_val >= s1_min_r and max_drift_ms <= s1_max_drift:
         s1_tempo_status = "PASS"
-    elif rubato_ok or (r_val >= 0.50 and max_drift_ms <= 60.0):
+    elif rubato_ok or (r_val >= max(0.35, s1_min_r - 0.20) and max_drift_ms <= max(60.0, s1_max_drift * 2.0)):
         s1_tempo_status = "WARN"
     else:
         s1_tempo_status = "FAIL"
 
     other_beats = beat_onsets[1:] if len(beat_onsets) > 1 else [0]
-    if pickup_aligned and beat_onsets[0] > max(other_beats):
+    if not s1_req_db_peak:
+        s1_downbeat_status = "PASS" if pickup_aligned else "WARN"
+    elif pickup_aligned and beat_onsets[0] > max(other_beats):
         s1_downbeat_status = "PASS"
     elif pickup_aligned and beat_onsets[0] >= float(np.mean(other_beats)):
         s1_downbeat_status = "WARN"
@@ -298,9 +330,9 @@ def main() -> None:
 
     if unmarked_gt12 > 0 or unclosed_ties > 0:
         s3_play_status = "FAIL"
-    elif spurious_16_32 == 0:
+    elif spurious_16_32 <= s3_sp16_pass:
         s3_play_status = "PASS"
-    elif spurious_16_32 <= 5:
+    elif spurious_16_32 <= s3_sp16_warn:
         s3_play_status = "WARN"
     else:
         s3_play_status = "FAIL"
@@ -315,15 +347,15 @@ def main() -> None:
         "s0_leading_note": (s0_lead, {"first_note_sec": cand["first_note_sec"], "pad2s_verified": pad2s_verified}),
         "s1_tempo_lock": (s1_tempo_status, {"bpm": args.bpm, "tempo_mode": tmap.mode, "circular_R": r_val, "max_drift_ms": max_drift_ms}),
         "s1_downbeat_meter": (s1_downbeat_status, {"beats_per_bar": args.beats_per_bar, "beat_type": beat_type, "beat_onsets": beat_onsets, "pickup_aligned": pickup_aligned}),
-        "s1_grid_cleanliness": ("PASS" if spurious_pct < 2.0 else ("WARN" if spurious_pct <= 8.0 else "FAIL"), {"spurious_16_32_pct": round(spurious_pct, 2)}),
+        "s1_grid_cleanliness": ("PASS" if spurious_pct < s1_sp16_pass else ("WARN" if spurious_pct <= s1_sp16_warn else "FAIL"), {"spurious_16_32_pct": round(spurious_pct, 2)}),
         "s2_clash_ghost_audit": ("PASS" if pitch_audit["confirmed_ghost_count"] == 0 else "FAIL", {"confirmed_ghosts": pitch_audit["confirmed_ghost_count"]}),
         "s2_out_of_scale_verify": ("PASS" if pitch_audit["out_of_scale_checked_pct"] == 100.0 else "FAIL", {"oos_count": pitch_audit["out_of_scale_count"], "weak_oos": pitch_audit["weak_out_of_scale_count"]}),
-        "s3_r1_clefs_voices": ("PASS" if (mid_clef_changes == 0 and max_voices_per_hand <= 2) else ("WARN" if mid_clef_changes <= 4 and max_voices_per_hand <= 2 else "FAIL"), {"mid_clef_changes": mid_clef_changes, "max_voices_per_hand": max_voices_per_hand}),
-        "s3_r1_rests_durations": ("PASS" if (dur_errors == 0 and visible_rests <= 100) else ("WARN" if dur_errors == 0 and visible_rests <= 160 else "FAIL"), {"dur_errors": dur_errors, "visible_rests": visible_rests}),
+        "s3_r1_clefs_voices": ("PASS" if (mid_clef_changes <= s3_clef_pass and max_voices_per_hand <= 2) else ("WARN" if mid_clef_changes <= max(4, s3_clef_pass + 2) and max_voices_per_hand <= 2 else "FAIL"), {"mid_clef_changes": mid_clef_changes, "max_voices_per_hand": max_voices_per_hand}),
+        "s3_r1_rests_durations": (s3_rests_status, {"dur_errors": dur_errors, "visible_rests": visible_rests, "rests_per_bar": round(rests_per_bar, 2)}),
         "s3_r1_playability_notation": (s3_play_status, {"unmarked_gt12": unmarked_gt12, "unclosed_ties": unclosed_ties, "spurious_16_32": spurious_16_32}),
         "s3_r2_pdf_visual": ("PASS" if (pdf_ok and args.pdf_visually_inspected) else ("WARN" if pdf_ok else "FAIL"), {"pdf_exists": pdf_ok, "visually_inspected": args.pdf_visually_inspected}),
         "s4_plan_before_exec": ("PASS" if plan_ok else "FAIL", {"plan_md": Path(args.dynamics_plan).is_file(), "envelope_csv": Path(args.dynamics_csv).is_file()}),
-        "s4_r1_static_dynamics": (evaluate_s4_r1_static_dynamics(placeholder_only, rh_med, lh_med, lh_max, unclosed_wedges), {"rh_med": rh_med, "lh_med": lh_med, "lh_max": lh_max, "unclosed_wedges": unclosed_wedges}),
+        "s4_r1_static_dynamics": (evaluate_s4_r1_static_dynamics(placeholder_only, rh_med, lh_med, lh_max, unclosed_wedges, eval_rubric=dyn_rubric), {"rh_med": rh_med, "lh_med": lh_med, "lh_max": lh_max, "unclosed_wedges": unclosed_wedges}),
         "s4_r2_acoustic_match": ("PASS" if (nan_inf == 0 and tail_snr >= 80 and abs(med_lh_err) <= 1.5 and abs(med_rh_err) <= 1.5 and band_150_diff <= 4.0) else ("WARN" if (nan_inf == 0 and tail_snr >= 70 and abs(med_lh_err) <= 2.5 and abs(med_rh_err) <= 2.5) else "FAIL"), {"nan_inf": nan_inf, "tail_snr_dB": round(tail_snr, 1), "median_lh_err_dB": round(med_lh_err, 2), "median_rh_err_dB": round(med_rh_err, 2), "band_20_150_pct_diff": round(band_150_diff, 2)}),
         "s5_deliverables_complete": ("PASS" if (pdf_ok and ab_ok) else ("WARN" if pdf_ok else "FAIL"), {"pdf_ok": pdf_ok, "ab_excerpts_ok": ab_ok}),
     }
@@ -341,7 +373,8 @@ def main() -> None:
         out_stages.append({"stage_id": st["stage_id"], "name": st["name"], "checks": checks_out})
 
     summary = {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
+        "style_profile": (profile or {}).get("profile_id", "default"),
         "overall_verdict": "PASS" if not blocking_fails else "FAIL",
         "blocking_fails": blocking_fails,
         "stages": out_stages,

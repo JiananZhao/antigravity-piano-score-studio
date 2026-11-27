@@ -257,3 +257,107 @@ def test_v3_manifest_roundtrip_and_transkun_quantization(tmp_path: Path) -> None
     q_mid = mido.MidiFile(str(out_mid))
     vels = [m.velocity for tr in q_mid.tracks for m in tr if m.type == "note_on" and m.velocity > 0]
     assert vels == [52, 88, 71]
+
+
+def test_krumhansl_schmuckler_key_detection() -> None:
+    """Verify Krumhansl-Schmuckler detects C major, A minor, and Bb major accurately."""
+    sa = _load_script("style_analyzer.py")
+
+    # C major: strong C-E-G-F-G-C cadence
+    c_maj_notes = [
+        (60, 0.0, 1.0, 90), (64, 0.0, 1.0, 82), (67, 0.0, 1.0, 80),
+        (65, 1.0, 2.0, 80), (69, 1.0, 2.0, 78), (60, 1.0, 2.0, 85),
+        (67, 2.0, 3.0, 84), (71, 2.0, 3.0, 80), (62, 2.0, 3.0, 76),
+        (60, 3.0, 5.0, 95), (64, 3.0, 5.0, 84), (67, 3.0, 5.0, 82),
+    ]
+    res_c = sa.detect_key_krumhansl_schmuckler(c_maj_notes)
+    assert res_c["key_name"] == "C major"
+    assert res_c["key_fifths"] == 0
+    assert res_c["confidence"] > 0.7
+
+    # Bb major (key_fifths = -2)
+    bb_maj_notes = [(p - 2, s, e, v) for p, s, e, v in c_maj_notes]
+    res_bb = sa.detect_key_krumhansl_schmuckler(bb_maj_notes)
+    assert res_bb["key_name"] == "Bb major"
+    assert res_bb["key_fifths"] == -2
+
+    # A minor (key_fifths = 0, mode = minor)
+    a_min_notes = [
+        (57, 0.0, 2.0, 92), (60, 0.0, 2.0, 84), (64, 0.0, 2.0, 82),
+        (62, 2.0, 3.0, 80), (65, 2.0, 3.0, 80), (57, 2.0, 3.0, 84),
+        (64, 3.0, 4.0, 85), (68, 3.0, 4.0, 80), (59, 3.0, 4.0, 78),
+        (57, 4.0, 6.0, 95), (60, 4.0, 6.0, 84), (64, 4.0, 6.0, 82),
+    ]
+    res_am = sa.detect_key_krumhansl_schmuckler(a_min_notes)
+    assert res_am["key_name"] == "A minor"
+    assert res_am["key_fifths"] == 0
+    assert res_am["mode"] == "minor"
+
+
+def test_musical_dna_and_style_classification() -> None:
+    """Verify 6-dim Musical DNA classifies Pop, Classical Rubato, Baroque, and Jazz distinctly."""
+    sa = _load_script("style_analyzer.py")
+
+    # 1. Pop Ballad: steady tempo, diatonic block chords, quarter/half notes
+    pop_notes = []
+    for bar in range(8):
+        b0 = bar * 4.0
+        for p in (48, 55, 60, 64, 67):
+            pop_notes.append((p, b0, b0 + 2.0, 80))
+        for p in (53, 57, 60, 65, 69):
+            pop_notes.append((p, b0 + 2.0, b0 + 4.0, 80))
+    dna_pop = sa.extract_musical_dna(pop_notes, tempo_map_dict={"bar_tempos_bpm": [72.0] * 8})
+    prof_pop, _, _, _ = sa.classify_style_profile(dna_pop)
+    assert prof_pop == "pop_ballad"
+
+    # 2. Classical Romantic: strong rubato tempo_cv + expressive 16th-note runs
+    cl_notes = []
+    for bar in range(8):
+        b0 = bar * 4.0
+        cl_notes.append((48, b0, b0 + 2.0, 72))
+        for k in range(8):
+            cl_notes.append((60 + (k % 7), b0 + k * 0.25, b0 + (k + 1) * 0.25, 84))
+    rubato_bpms = [62.0, 68.0, 78.0, 84.0, 74.0, 64.0, 80.0, 60.0]
+    dna_cl = sa.extract_musical_dna(cl_notes, tempo_map_dict={"bar_tempos_bpm": rubato_bpms})
+    prof_cl, _, _, _ = sa.classify_style_profile(dna_cl)
+    assert prof_cl == "classical_romantic"
+
+    # 3. Baroque Polyphonic: steady tempo + continuous 16th notes + staggered overlapping voices
+    baroque_notes = []
+    for step in range(64):
+        t = step * 0.25
+        baroque_notes.append((72 + (step % 5), t, t + 0.5, 82))
+        if step % 2 == 1:
+            baroque_notes.append((55 + (step % 4), t, t + 0.75, 80))
+    dna_bq = sa.extract_musical_dna(baroque_notes, tempo_map_dict={"bar_tempos_bpm": [96.0] * 8})
+    prof_bq, _, _, _ = sa.classify_style_profile(dna_bq)
+    assert prof_bq == "baroque_polyphonic"
+
+    # 4. Jazz Groove: swing long-short eighths (0.67 / 0.33) + chromatic extensions + off-beat syncopation
+    jazz_notes = []
+    for beat in range(24):
+        t0 = float(beat)
+        t_sw = t0 + 0.67
+        jazz_notes.append((60 + (beat % 12), t0, t0 + 0.60, 86))
+        jazz_notes.append((63 + ((beat * 5) % 12), t_sw, t_sw + 0.28, 82))
+    dna_jz = sa.extract_musical_dna(jazz_notes, tempo_map_dict={"bar_tempos_bpm": [128.0] * 6})
+    prof_jz, _, _, _ = sa.classify_style_profile(dna_jz)
+    assert prof_jz == "jazz_groove"
+
+
+def test_style_profiles_and_dynamic_eval_rubric() -> None:
+    """Verify all 4 declarative profiles load cleanly and adapt eval_gate_runner static dynamics."""
+    sa = _load_script("style_analyzer.py")
+    eg = _load_script("eval_gate_runner.py")
+
+    required_sections = {"transcription", "pitch_audit", "engraving", "dynamics", "eval_rubric"}
+    for pid in sa.VALID_PROFILES:
+        prof = sa.load_style_profile(pid)
+        assert prof["profile_id"] == pid
+        assert required_sections.issubset(prof.keys())
+
+    # Balanced Baroque counterpoint (rh_med=84, lh_med=82, lh_max=98) fails legacy Pop rubric
+    # but PASSES under baroque_polyphonic dynamic rubric.
+    assert eg.evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0) == "FAIL"
+    baroque_rubric = sa.load_style_profile("baroque_polyphonic")["eval_rubric"]
+    assert eg.evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0, eval_rubric=baroque_rubric) == "PASS"

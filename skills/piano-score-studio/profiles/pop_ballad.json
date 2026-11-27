@@ -1,0 +1,45 @@
+{
+  "profile_id": "pop_ballad",
+  "display_name": "Pop / Modern Ballad Solo Piano",
+  "description": "Homophonic melody + sustained accompaniment, straight eighth/sixteenth grid, clear RH melody prominence over LH harmony.",
+  "transcription": {
+    "default_grid": 4,
+    "tempo_mode_preference": "auto",
+    "allow_swing": false
+  },
+  "pitch_audit": {
+    "ghost_f0_gap_db": 12.0,
+    "ghost_og_db": 3.0,
+    "weak_oos_snr_db": 12.0,
+    "allow_chromatic_clusters": false
+  },
+  "engraving": {
+    "split_center": 63.5,
+    "lh_max_pitch": 65,
+    "rh_min_pitch": 58,
+    "max_hand_span": 12,
+    "enable_gap_bridging": true,
+    "bridge_rms_db": -38.0,
+    "anchor_min_dur_beats": 1.5,
+    "max_voices_per_hand": 2
+  },
+  "dynamics": {
+    "pedal_style": "legato_harmonic",
+    "target_rh_lh_diff_db": 3.5,
+    "lh_ceiling_vel": 90
+  },
+  "eval_rubric": {
+    "s1_min_circular_r_pass": 0.70,
+    "s1_max_drift_ms_pass": 30.0,
+    "s1_require_downbeat_peak": true,
+    "s1_spurious_16_pass_pct": 2.0,
+    "s1_spurious_16_warn_pct": 8.0,
+    "s3_max_spurious_16_pass": 0,
+    "s3_max_spurious_16_warn": 5,
+    "s3_max_rests_per_bar_pass": 2.5,
+    "s3_max_rests_per_bar_warn": 4.0,
+    "s3_max_mid_clef_changes_pass": 0,
+    "s4_max_lh_vel_pass": 90,
+    "s4_min_rh_lh_diff_pass": 10
+  }
+}

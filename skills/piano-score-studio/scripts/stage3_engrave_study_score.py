@@ -32,6 +32,7 @@ import soundfile as sf
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tempo_map import TempoMap, load_tempo_map
+from style_analyzer import load_style_profile
 
 DIVISIONS = 2  # Default divisions per quarter note (2 = eighth-note grid)
 
@@ -180,7 +181,13 @@ def load_slot_rms_db(
     return dbs
 
 
-def split_hands(notes: list[RawNote]) -> None:
+def split_hands(
+    notes: list[RawNote],
+    split_center: float = 63.5,
+    lh_max_pitch: int = 65,
+    rh_min_pitch: int = 58,
+    max_hand_span: int = 12,
+) -> None:
     by_slot: dict[int, list[RawNote]] = {}
     for n in notes:
         by_slot.setdefault(n.start_slot, []).append(n)
@@ -201,21 +208,21 @@ def split_hands(notes: list[RawNote]) -> None:
                 cost = 0.0
                 if lh:
                     sp = lh[-1].pitch - lh[0].pitch
-                    if sp > 12:
-                        cost += 25.0 * (sp - 12) ** 2
+                    if sp > max_hand_span:
+                        cost += 25.0 * (sp - max_hand_span) ** 2
                     for x in lh:
-                        if x.pitch > 65:
-                            cost += 40.0 * (x.pitch - 65) ** 2
-                        cost += 1.5 * max(0.0, x.pitch - 63.5)
+                        if x.pitch > lh_max_pitch:
+                            cost += 40.0 * (x.pitch - lh_max_pitch) ** 2
+                        cost += 1.5 * max(0.0, x.pitch - split_center)
                     cost += 0.5 * abs(sum(x.pitch for x in lh) / len(lh) - prev_lh_c)
                 if rh:
                     sp = rh[-1].pitch - rh[0].pitch
-                    if sp > 12:
-                        cost += 25.0 * (sp - 12) ** 2
+                    if sp > max_hand_span:
+                        cost += 25.0 * (sp - max_hand_span) ** 2
                     for x in rh:
-                        if x.pitch < 58:
-                            cost += 30.0 * (58 - x.pitch) ** 2
-                        cost += 1.5 * max(0.0, 63.5 - x.pitch)
+                        if x.pitch < rh_min_pitch:
+                            cost += 30.0 * (rh_min_pitch - x.pitch) ** 2
+                        cost += 1.5 * max(0.0, split_center - x.pitch)
                     cost += 0.5 * abs(sum(x.pitch for x in rh) / len(rh) - prev_rh_c)
                 if cost < best_cost:
                     best_cost, best_s = cost, s
@@ -297,7 +304,11 @@ def bridge_gaps(
     bar_len: int,
     slot_rms: np.ndarray,
     divisions: int,
+    enable_gap_bridging: bool = True,
+    bridge_rms_db: float = -38.0,
 ) -> None:
+    if not enable_gap_bridging:
+        return
     eighth_slots = max(1, divisions // 2)
     quarter_slots = divisions
     for i, ev in enumerate(events):
@@ -306,14 +317,14 @@ def bridge_gaps(
             nxt = events[i + 1].slot
             if 0 < (nxt - end_sl) <= eighth_slots:
                 if all(
-                    (bar_global_start + s) < len(slot_rms) and slot_rms[bar_global_start + s] > -38.0
+                    (bar_global_start + s) < len(slot_rms) and slot_rms[bar_global_start + s] > bridge_rms_db
                     for s in range(end_sl, nxt)
                 ):
                     ev.dur = nxt - ev.slot
         else:
             gap = bar_len - end_sl
             if 0 < gap <= quarter_slots and all(
-                slot_rms[bar_global_start + s] > -38.0
+                slot_rms[bar_global_start + s] > bridge_rms_db
                 for s in range(end_sl, bar_len)
                 if bar_global_start + s < len(slot_rms)
             ):
@@ -327,6 +338,9 @@ def simplify_bar_hand(
     bar_len: int,
     slot_rms: np.ndarray,
     divisions: int,
+    enable_gap_bridging: bool = True,
+    bridge_rms_db: float = -38.0,
+    anchor_min_dur_beats: float = 1.5,
 ) -> tuple[list[ChordEvent], list[ChordEvent] | None]:
     if not segs:
         return [], None
@@ -343,7 +357,7 @@ def simplify_bar_hand(
             v1.append(ChordEvent(sl, max(1, min(min(x.dur for x in grp), nxt - sl)), grp))
         return v1, None
 
-    anchor_min_dur = int(round(1.5 * divisions))
+    anchor_min_dur = int(round(anchor_min_dur_beats * divisions))
     anchor_segs: list[BarSegment] = []
     anchor_is_lower = True
     for sl in slots:
@@ -376,7 +390,7 @@ def simplify_bar_hand(
                     out.append(ChordEvent(sl, max(1, min(max(x.dur for x in g), nxt - sl)), g))
                 return out
             eva, evm = pack(v_a), pack(v_m)
-            bridge_gaps(evm, bar_global_start, bar_len, slot_rms, divisions)
+            bridge_gaps(evm, bar_global_start, bar_len, slot_rms, divisions, enable_gap_bridging=enable_gap_bridging, bridge_rms_db=bridge_rms_db)
             return (evm, eva) if anchor_is_lower else (eva, evm)
 
     v1 = []
@@ -385,7 +399,7 @@ def simplify_bar_hand(
         nxt = slots[i + 1] if i + 1 < len(slots) else bar_len
         d = (bar_len - sl) if (nxt == bar_len and any(x.tie_start for x in grp)) else min(min(x.dur for x in grp), nxt - sl)
         v1.append(ChordEvent(sl, max(1, d), grp))
-    bridge_gaps(v1, bar_global_start, bar_len, slot_rms, divisions)
+    bridge_gaps(v1, bar_global_start, bar_len, slot_rms, divisions, enable_gap_bridging=enable_gap_bridging, bridge_rms_db=bridge_rms_db)
     return v1, None
 
 
@@ -576,6 +590,7 @@ def main() -> None:
     ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--dynamics-csv", default=None)
+    ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
     ap.add_argument("--musescore", default=None)
     ap.add_argument("--out-xml", required=True)
     ap.add_argument("--out-pdf", default=None)
@@ -589,7 +604,18 @@ def main() -> None:
     total_slots = max(n.start_slot + n.dur for n in notes) + bar_slots
     tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, args.beat_type, args.first_downbeat)
     slot_rms = load_slot_rms_db(Path(args.audio), args.bpm, args.beat_type, divisions, args.first_downbeat, bar1_slot, total_slots, tempo_map=tmap)
-    split_hands(notes)
+    profile = load_style_profile(args.style_profile) if args.style_profile else None
+    eng_cfg = (profile or {}).get("engraving", {})
+    split_hands(
+        notes,
+        split_center=float(eng_cfg.get("split_center", 63.5)),
+        lh_max_pitch=int(eng_cfg.get("lh_max_pitch", 65)),
+        rh_min_pitch=int(eng_cfg.get("rh_min_pitch", 58)),
+        max_hand_span=int(eng_cfg.get("max_hand_span", 12)),
+    )
+    enable_gap_bridging = bool(eng_cfg.get("enable_gap_bridging", True))
+    bridge_rms_db = float(eng_cfg.get("bridge_rms_db", -38.0))
+    anchor_min_dur_beats = float(eng_cfg.get("anchor_min_dur_beats", 1.5))
     bars_map, max_bar = slice_into_bars(notes, pickup_start, bar_slots)
 
     pc_table = FLAT_PC_SPELLING if args.key_fifths <= 0 else SHARP_PC_SPELLING
@@ -687,8 +713,14 @@ def main() -> None:
             ET.SubElement(ET.SubElement(ET.SubElement(dd, "direction-type"), "dynamics", {"relative-y": "-18"}), val)
             ET.SubElement(dd, "staff").text = "1"
 
-        rh_v1, rh_v2 = simplify_bar_hand(bars_map.get((b, 1), []), b, b_global, bar_len, slot_rms, divisions)
-        lh_v1, lh_v2 = simplify_bar_hand(bars_map.get((b, 2), []), b, b_global, bar_len, slot_rms, divisions)
+        rh_v1, rh_v2 = simplify_bar_hand(
+            bars_map.get((b, 1), []), b, b_global, bar_len, slot_rms, divisions,
+            enable_gap_bridging=enable_gap_bridging, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
+        )
+        lh_v1, lh_v2 = simplify_bar_hand(
+            bars_map.get((b, 2), []), b, b_global, bar_len, slot_rms, divisions,
+            enable_gap_bridging=enable_gap_bridging, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
+        )
 
         def emit_staff(v1: list[ChordEvent], v2: list[ChordEvent] | None, staff: int, v_id1: int, v_id2: int) -> None:
             acc_state: dict[tuple[str, int], int] = {}
