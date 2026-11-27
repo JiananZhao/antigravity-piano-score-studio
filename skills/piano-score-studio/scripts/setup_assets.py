@@ -47,7 +47,7 @@ def find_musescore(cfg: dict) -> str | None:
     platform_candidates = (
         Path(r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe"),
         Path(r"C:\Program Files (x86)\MuseScore 4\bin\MuseScore4.exe"),
-        Path(r"E:\AI\Playground\PianoTranscription\tools\MuseScorePortable\App\MuseScore\bin\MuseScore4.exe"),
+        Path.home() / "AppData" / "Local" / "Programs" / "MuseScore 4" / "bin" / "MuseScore4.exe",
         Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore"),
         Path("/usr/bin/mscore"),
         Path("/usr/bin/musescore"),
@@ -83,9 +83,7 @@ def find_renderer(cfg: dict, plugin_root: Path) -> dict:
     if not sfizz:
         sfizz = shutil.which("sfizz_render") or find_local_sfizz(plugin_root)
 
-    ml_root_str = cfg.get("music_learning_root") or ""
-    if not ml_root_str and Path(r"E:\AI\Playground\music-learning").is_dir():
-        ml_root_str = r"E:\AI\Playground\music-learning"
+    ml_root_str = cfg.get("music_learning_root") or os.environ.get("MUSIC_LEARNING_ROOT", "")
     native_ok = bool(ml_root_str) and (Path(ml_root_str) / "scripts" / "native_host.py").is_file()
     return {
         "sfizz_render": sfizz,
@@ -98,8 +96,10 @@ def find_salamander_sfz(plugin_root: Path, cfg: dict) -> Path | None:
     candidates = [
         Path(rel) if Path(rel).is_absolute() else (plugin_root / rel),
         plugin_root / "assets_local" / "salamander" / "Salamander Grand Piano V3.sfz",
-        Path(r"E:\AI\Playground\music-learning\data\instruments\render_tmp\resources\Salamander Grand Piano V3.sfz"),
     ]
+    ml_root = cfg.get("music_learning_root") or os.environ.get("MUSIC_LEARNING_ROOT", "")
+    if ml_root:
+        candidates.append(Path(ml_root) / "data" / "instruments" / "render_tmp" / "resources" / "Salamander Grand Piano V3.sfz")
     for p in candidates:
         if p.is_file():
             return p

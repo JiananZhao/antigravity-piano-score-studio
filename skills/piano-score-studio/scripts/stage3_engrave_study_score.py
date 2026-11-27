@@ -5,6 +5,7 @@ Produces a clean, human-readable study edition for any solo piano MIDI/audio:
 - Locked RH (G2) and LH (F4) clefs with zero intra-bar clef flipping
 - Span-aware hand splitting with <arpeggiate/> on wide chords (>12 semitones)
 - Max 2 voices per hand, hidden structural spacer rests, audio-aware legato gap fill
+- Configurable quantization grid (8th / triplet-8th / 16th) & simple/compound meters (beat-type 4 or 8)
 - Beat-grouped beaming and key-consistent enharmonic spelling
 - Phrase dynamics derived automatically from bar_lh_rh_envelope.csv (when provided)
 - Balanced A4 4-bar phrase pagination
@@ -28,7 +29,7 @@ import mido
 import numpy as np
 import soundfile as sf
 
-DIVISIONS = 2  # 2 per quarter note -> 1 unit = 1 eighth note
+DIVISIONS = 2  # Default divisions per quarter note (2 = eighth-note grid)
 
 SHARP_PC_SPELLING = {
     0: ("C", 0), 1: ("C", 1), 2: ("D", 0), 3: ("D", 1), 4: ("E", 0), 5: ("F", 0),
@@ -87,13 +88,29 @@ class RenderedAtom:
     is_rest: bool
     print_object: bool
     pitches: list[tuple[int, bool, bool, bool]]
-    beam: str | None = None
+    beam1: str | None = None
+    beam2: str | None = None
+    tuplet: tuple[int, int] | None = None
 
 
-def load_midi_notes(path: Path, bar_slots: int) -> tuple[list[RawNote], int]:
-    """Load MIDI notes quantized to eighth-note grid; detect Bar 0 pickup if first bar is partial."""
+def compute_grid_metrics(beats_per_bar: int, beat_type: int, grid: int) -> tuple[int, int, int, int]:
+    """Return (divisions, bar_slots, beat_slots, beam_group_slots)."""
+    divisions = grid  # MusicXML divisions = slots per quarter note (2=8th, 3=triplet-8th, 4=16th)
+    if beat_type == 8 and divisions == 3:
+        raise ValueError("--grid 3 (quarter-note triplets) is only valid with --beat-type 4; use --grid 2 or 4 for 6/8.")
+    bar_slots = (beats_per_bar * divisions * 4) // beat_type
+    if beat_type == 8 and beats_per_bar % 3 == 0:
+        beat_slots = 3 * (divisions // 2)  # compound dotted-quarter beat (3 eighths)
+    else:
+        beat_slots = divisions if beat_type == 4 else max(1, divisions // 2)
+    beam_group_slots = beat_slots
+    return divisions, bar_slots, beat_slots, beam_group_slots
+
+
+def load_midi_notes(path: Path, divisions: int, bar_slots: int) -> tuple[list[RawNote], int]:
+    """Load MIDI notes quantized to the chosen division grid; detect Bar 0 pickup if first bar is partial."""
     mid = mido.MidiFile(path)
-    ticks_per_eighth = mid.ticks_per_beat // 2
+    ticks_per_slot = mid.ticks_per_beat / float(divisions)
     notes: list[RawNote] = []
     for tr in mid.tracks:
         t = 0
@@ -104,13 +121,25 @@ def load_midi_notes(path: Path, bar_slots: int) -> tuple[list[RawNote], int]:
                 if msg.note in active:
                     st = active.pop(msg.note)
                     if t > st:
-                        notes.append(RawNote(int(round(st / ticks_per_eighth)), max(1, int(round((t - st) / ticks_per_eighth))), msg.note))
+                        notes.append(
+                            RawNote(
+                                int(round(st / ticks_per_slot)),
+                                max(1, int(round((t - st) / ticks_per_slot))),
+                                msg.note,
+                            )
+                        )
                 active[msg.note] = t
             elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
                 if msg.note in active:
                     st = active.pop(msg.note)
                     if t > st:
-                        notes.append(RawNote(int(round(st / ticks_per_eighth)), max(1, int(round((t - st) / ticks_per_eighth))), msg.note))
+                        notes.append(
+                            RawNote(
+                                int(round(st / ticks_per_slot)),
+                                max(1, int(round((t - st) / ticks_per_slot))),
+                                msg.note,
+                            )
+                        )
     notes.sort(key=lambda n: (n.start_slot, n.pitch))
     if not notes:
         return notes, 0
@@ -119,14 +148,23 @@ def load_midi_notes(path: Path, bar_slots: int) -> tuple[list[RawNote], int]:
     return notes, pickup_start
 
 
-def load_slot_rms_db(audio_path: Path, bpm: float, first_downbeat: float, bar1_slot: int, total_slots: int) -> np.ndarray:
+def load_slot_rms_db(
+    audio_path: Path,
+    bpm: float,
+    beat_type: int,
+    divisions: int,
+    first_downbeat: float,
+    bar1_slot: int,
+    total_slots: int,
+) -> np.ndarray:
     data, sr = sf.read(str(audio_path), dtype="float64", always_2d=True)
     mono = data.mean(axis=1)
-    eighth_s = 30.0 / bpm
+    quarter_s = (60.0 / bpm) * (beat_type / 4.0)
+    slot_s = quarter_s / float(divisions)
     dbs = np.full(total_slots, -60.0, dtype=np.float64)
     for s in range(total_slots):
-        t0 = first_downbeat + (s - bar1_slot) * eighth_s
-        t1 = t0 + eighth_s
+        t0 = first_downbeat + (s - bar1_slot) * slot_s
+        t1 = t0 + slot_s
         i0, i1 = max(0, int(round(t0 * sr))), min(len(mono), int(round(t1 * sr)))
         if i1 > i0:
             dbs[s] = 20.0 * np.log10(float(np.sqrt(np.mean(mono[i0:i1] ** 2))) + 1e-12)
@@ -244,18 +282,28 @@ def slice_into_bars(
     return bars, max_bar
 
 
-def bridge_gaps(events: list[ChordEvent], bar_global_start: int, bar_len: int, slot_rms: np.ndarray) -> None:
+def bridge_gaps(
+    events: list[ChordEvent],
+    bar_global_start: int,
+    bar_len: int,
+    slot_rms: np.ndarray,
+    divisions: int,
+) -> None:
+    eighth_slots = max(1, divisions // 2)
+    quarter_slots = divisions
     for i, ev in enumerate(events):
         end_sl = ev.slot + ev.dur
         if i + 1 < len(events):
             nxt = events[i + 1].slot
-            if nxt - end_sl == 1:
-                gs = bar_global_start + end_sl
-                if gs < len(slot_rms) and slot_rms[gs] > -38.0:
+            if 0 < (nxt - end_sl) <= eighth_slots:
+                if all(
+                    (bar_global_start + s) < len(slot_rms) and slot_rms[bar_global_start + s] > -38.0
+                    for s in range(end_sl, nxt)
+                ):
                     ev.dur = nxt - ev.slot
         else:
             gap = bar_len - end_sl
-            if 0 < gap <= 2 and all(
+            if 0 < gap <= quarter_slots and all(
                 slot_rms[bar_global_start + s] > -38.0
                 for s in range(end_sl, bar_len)
                 if bar_global_start + s < len(slot_rms)
@@ -264,7 +312,12 @@ def bridge_gaps(events: list[ChordEvent], bar_global_start: int, bar_len: int, s
 
 
 def simplify_bar_hand(
-    segs: list[BarSegment], bar: int, bar_global_start: int, bar_len: int, slot_rms: np.ndarray
+    segs: list[BarSegment],
+    bar: int,
+    bar_global_start: int,
+    bar_len: int,
+    slot_rms: np.ndarray,
+    divisions: int,
 ) -> tuple[list[ChordEvent], list[ChordEvent] | None]:
     if not segs:
         return [], None
@@ -281,11 +334,12 @@ def simplify_bar_hand(
             v1.append(ChordEvent(sl, max(1, min(min(x.dur for x in grp), nxt - sl)), grp))
         return v1, None
 
+    anchor_min_dur = int(round(1.5 * divisions))
     anchor_segs: list[BarSegment] = []
     anchor_is_lower = True
     for sl in slots:
         for seg in by_s[sl]:
-            if seg.dur >= 3:
+            if seg.dur >= anchor_min_dur:
                 later = [s2 for s2 in slots if sl < s2 < sl + seg.dur]
                 if len(later) >= 2:
                     lp = [x.pitch for s2 in later for x in by_s[s2]]
@@ -313,7 +367,7 @@ def simplify_bar_hand(
                     out.append(ChordEvent(sl, max(1, min(max(x.dur for x in g), nxt - sl)), g))
                 return out
             eva, evm = pack(v_a), pack(v_m)
-            bridge_gaps(evm, bar_global_start, bar_len, slot_rms)
+            bridge_gaps(evm, bar_global_start, bar_len, slot_rms, divisions)
             return (evm, eva) if anchor_is_lower else (eva, evm)
 
     v1 = []
@@ -322,50 +376,70 @@ def simplify_bar_hand(
         nxt = slots[i + 1] if i + 1 < len(slots) else bar_len
         d = (bar_len - sl) if (nxt == bar_len and any(x.tie_start for x in grp)) else min(min(x.dur for x in grp), nxt - sl)
         v1.append(ChordEvent(sl, max(1, d), grp))
-    bridge_gaps(v1, bar_global_start, bar_len, slot_rms)
+    bridge_gaps(v1, bar_global_start, bar_len, slot_rms, divisions)
     return v1, None
 
 
-def split_duration(slot: int, dur: int, is_rest: bool) -> list[tuple[int, int, str, bool]]:
-    if is_rest:
-        pieces, cur, rem = [], slot, dur
-        while rem > 0:
-            if cur % 2 == 0 and rem >= 4 and (cur in (0, 2, 4)):
-                pieces.append((cur, 4, "half", False))
-                cur += 4; rem -= 4
-            elif cur % 2 == 0 and rem >= 2:
-                pieces.append((cur, 2, "quarter", False))
-                cur += 2; rem -= 2
-            else:
-                pieces.append((cur, 1, "eighth", False))
-                cur += 1; rem -= 1
-        return pieces
-    if dur == 1:
-        return [(slot, 1, "eighth", False)]
-    if dur == 2:
-        return [(slot, 2, "quarter", False)]
-    if dur == 3 and slot % 3 == 0:
-        return [(slot, 3, "quarter", True)]
-    if dur == 4 and slot % 2 == 0:
-        return [(slot, 4, "half", False)]
-    if dur == 6 and slot == 0:
-        return [(0, 6, "half", True)]
-    if dur == 8 and slot == 0:
-        return [(0, 8, "whole", False)]
-    out, c, r = [], slot, dur
-    while r > 0:
-        if c % 2 == 0 and r >= 4:
-            step, tp = 4, "half"
-        elif c % 2 == 0 and r >= 2:
-            step, tp = 2, "quarter"
-        else:
-            step, tp = 1, "eighth"
-        out.append((c, step, tp, False))
-        c += step; r -= step
+def split_duration(
+    slot: int,
+    dur: int,
+    is_rest: bool,
+    divisions: int,
+    beat_slots: int,
+) -> list[tuple[int, int, str, bool, tuple[int, int] | None]]:
+    """Split arbitrary slot duration into MusicXML-valid rhythmic atoms aligned to beat boundaries."""
+    if divisions == 2:
+        table = [
+            (8, "whole", False, None, lambda c: c == 0),
+            (6, "half", True, None, lambda c: (not is_rest or beat_slots == 3) and c == 0),
+            (4, "half", False, None, lambda c: c % 2 == 0 and beat_slots != 3),
+            (3, "quarter", True, None, lambda c: (c % beat_slots == 0) if (not is_rest or beat_slots == 3) else False),
+            (2, "quarter", False, None, lambda c: c % 2 == 0),
+            (1, "eighth", False, None, lambda c: True),
+        ]
+    elif divisions == 4:
+        table = [
+            (16, "whole", False, None, lambda c: c == 0),
+            (12, "half", True, None, lambda c: (not is_rest or beat_slots == 6) and c == 0),
+            (8, "half", False, None, lambda c: c % 4 == 0 and beat_slots != 6),
+            (6, "quarter", True, None, lambda c: (c % 2 == 0) if not is_rest else (beat_slots == 6 and c % 6 == 0)),
+            (4, "quarter", False, None, lambda c: c % 4 == 0),
+            (3, "eighth", True, None, lambda c: (not is_rest) and c % 2 == 0),
+            (2, "eighth", False, None, lambda c: c % 2 == 0),
+            (1, "16th", False, None, lambda c: True),
+        ]
+    else:  # divisions == 3 (eighth-note triplets per quarter beat)
+        table = [
+            (12, "whole", False, None, lambda c: c == 0),
+            (9, "half", True, None, lambda c: (not is_rest) and c == 0),
+            (6, "half", False, None, lambda c: c % 3 == 0),
+            (3, "quarter", False, None, lambda c: c % 3 == 0),
+            (2, "quarter", False, (3, 2), lambda c: (not is_rest) and c % 3 == 0),
+            (1, "eighth", False, (3, 2), lambda c: True),
+        ]
+
+    out: list[tuple[int, int, str, bool, tuple[int, int] | None]] = []
+    c, rem = slot, dur
+    while rem > 0:
+        max_step = (beat_slots - (c % beat_slots)) if (c % beat_slots != 0) else rem
+        limit = min(rem, max_step)
+        for step, tp, dot, tup, ok in table:
+            if step <= limit and ok(c):
+                out.append((c, step, tp, dot, tup))
+                c += step
+                rem -= step
+                break
     return out
 
 
-def build_voice_atoms(events: list[ChordEvent], bar_len: int, other: list[ChordEvent] | None) -> list[RenderedAtom]:
+def build_voice_atoms(
+    events: list[ChordEvent],
+    bar_len: int,
+    other: list[ChordEvent] | None,
+    divisions: int,
+    beat_slots: int,
+    beam_group_slots: int,
+) -> list[RenderedAtom]:
     if not events:
         return []
     covered = {s for oe in (other or []) for s in range(oe.slot, oe.slot + oe.dur)}
@@ -373,29 +447,58 @@ def build_voice_atoms(events: list[ChordEvent], bar_len: int, other: list[ChordE
     cur = 0
     for ev in events:
         if ev.slot > cur:
-            for ps, pd, pt, pdot in split_duration(cur, ev.slot - cur, True):
+            for ps, pd, pt, pdot, ptup in split_duration(cur, ev.slot - cur, True, divisions, beat_slots):
                 hide = other is not None and all(s in covered for s in range(ps, ps + pd))
-                atoms.append(RenderedAtom(ps, pd, pt, pdot, True, not hide, []))
-        pieces = split_duration(ev.slot, ev.dur, False)
-        for idx, (ps, pd, pt, pdot) in enumerate(pieces):
+                atoms.append(RenderedAtom(ps, pd, pt, pdot, True, not hide, [], tuplet=ptup))
+        pieces = split_duration(ev.slot, ev.dur, False, divisions, beat_slots)
+        for idx, (ps, pd, pt, pdot, ptup) in enumerate(pieces):
             is_f, is_l = (idx == 0), (idx == len(pieces) - 1)
             plist = []
             for seg in ev.segs:
                 t_stop = seg.tie_stop if is_f else True
                 t_start = True if not is_l else (seg.tie_start if ev.slot + ev.dur == bar_len else False)
                 plist.append((seg.pitch, t_stop, t_start, seg.arpeggiate and is_f))
-            atoms.append(RenderedAtom(ps, pd, pt, pdot, False, True, plist))
+            atoms.append(RenderedAtom(ps, pd, pt, pdot, False, True, plist, tuplet=ptup))
         cur = ev.slot + ev.dur
     if cur < bar_len:
-        for ps, pd, pt, pdot in split_duration(cur, bar_len - cur, True):
+        for ps, pd, pt, pdot, ptup in split_duration(cur, bar_len - cur, True, divisions, beat_slots):
             hide = other is not None and all(s in covered for s in range(ps, ps + pd))
-            atoms.append(RenderedAtom(ps, pd, pt, pdot, True, not hide, []))
+            atoms.append(RenderedAtom(ps, pd, pt, pdot, True, not hide, [], tuplet=ptup))
 
-    by_sl = {a.slot: a for a in atoms if not a.is_rest and a.dur == 1 and a.type_str == "eighth"}
-    for b_st in range(0, bar_len, 2):
-        if b_st in by_sl and (b_st + 1) in by_sl:
-            by_sl[b_st].beam = "begin"
-            by_sl[b_st + 1].beam = "end"
+    beamable = {"eighth", "16th"}
+    run: list[RenderedAtom] = []
+
+    def flush_run() -> None:
+        if len(run) >= 2:
+            for i, at in enumerate(run):
+                at.beam1 = "begin" if i == 0 else ("end" if i == len(run) - 1 else "continue")
+                if at.type_str == "16th":
+                    prev_16 = i > 0 and run[i - 1].type_str == "16th"
+                    next_16 = i + 1 < len(run) and run[i + 1].type_str == "16th"
+                    if prev_16 and next_16:
+                        at.beam2 = "continue"
+                    elif next_16:
+                        at.beam2 = "begin"
+                    elif prev_16:
+                        at.beam2 = "end"
+                    else:
+                        at.beam2 = "forward hook" if i == 0 else "backward hook"
+        run.clear()
+
+    prev_grp = -1
+    for at in atoms:
+        grp = at.slot // beam_group_slots
+        if (not at.is_rest) and (at.type_str in beamable) and (not run or (grp == prev_grp and at.slot == run[-1].slot + run[-1].dur)):
+            run.append(at)
+            prev_grp = grp
+        else:
+            flush_run()
+            if (not at.is_rest) and (at.type_str in beamable):
+                run.append(at)
+                prev_grp = grp
+            else:
+                prev_grp = -1
+    flush_run()
     return atoms
 
 
@@ -422,6 +525,13 @@ def derive_dynamics_from_csv(csv_path: Path | None, max_bar: int) -> dict[int, l
 def find_musescore(explicit: str | None) -> str | None:
     if explicit and Path(explicit).is_file():
         return explicit
+    plugin_root = Path(__file__).resolve().parents[3]
+    cfg_path = plugin_root / "config.json"
+    if cfg_path.is_file():
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg_ms = cfg.get("musescore_exe")
+        if cfg_ms and Path(cfg_ms).is_file():
+            return str(Path(cfg_ms))
     env_p = os.environ.get("MUSCRIPTOR_MUSESCORE")
     if env_p and Path(env_p).is_file():
         return env_p
@@ -430,8 +540,10 @@ def find_musescore(explicit: str | None) -> str | None:
         if h:
             return h
     for p in (
-        Path(r"E:\AI\Playground\PianoTranscription\tools\MuseScorePortable\App\MuseScore\bin\MuseScore4.exe"),
         Path(r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe"),
+        Path(r"C:\Program Files (x86)\MuseScore 4\bin\MuseScore4.exe"),
+        Path.home() / "AppData" / "Local" / "Programs" / "MuseScore 4" / "bin" / "MuseScore4.exe",
+        Path("/Applications/MuseScore 4.app/Contents/MacOS/mscore"),
     ):
         if p.is_file():
             return str(p)
@@ -449,6 +561,8 @@ def main() -> None:
     ap.add_argument("--subtitle", default="Piano Solo (Study Edition)")
     ap.add_argument("--bpm", type=float, required=True)
     ap.add_argument("--beats-per-bar", type=int, required=True)
+    ap.add_argument("--beat-type", type=int, default=4, choices=(4, 8), help="Time signature denominator (4 or 8)")
+    ap.add_argument("--grid", type=int, default=DIVISIONS, choices=(2, 3, 4), help="Subdivisions per quarter note (2=8th, 3=triplet-8th, 4=16th)")
     ap.add_argument("--first-downbeat", type=float, required=True)
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--dynamics-csv", default=None)
@@ -457,11 +571,13 @@ def main() -> None:
     ap.add_argument("--out-pdf", default=None)
     args = ap.parse_args()
 
-    bar_slots = args.beats_per_bar * DIVISIONS
-    notes, pickup_start = load_midi_notes(Path(args.midi), bar_slots)
+    divisions, bar_slots, beat_slots, beam_group_slots = compute_grid_metrics(args.beats_per_bar, args.beat_type, args.grid)
+    notes, pickup_start = load_midi_notes(Path(args.midi), divisions, bar_slots)
+    if not notes:
+        raise ValueError(f"No playable notes found in MIDI: {args.midi}")
     bar1_slot = bar_slots if pickup_start > 0 else 0
     total_slots = max(n.start_slot + n.dur for n in notes) + bar_slots
-    slot_rms = load_slot_rms_db(Path(args.audio), args.bpm, args.first_downbeat, bar1_slot, total_slots)
+    slot_rms = load_slot_rms_db(Path(args.audio), args.bpm, args.beat_type, divisions, args.first_downbeat, bar1_slot, total_slots)
     split_hands(notes)
     bars_map, max_bar = slice_into_bars(notes, pickup_start, bar_slots)
 
@@ -530,11 +646,11 @@ def main() -> None:
 
         if b == start_bar:
             attr = ET.SubElement(m_el, "attributes")
-            ET.SubElement(attr, "divisions").text = str(DIVISIONS)
+            ET.SubElement(attr, "divisions").text = str(divisions)
             ET.SubElement(ET.SubElement(attr, "key"), "fifths").text = str(args.key_fifths)
             tm = ET.SubElement(attr, "time")
             ET.SubElement(tm, "beats").text = str(args.beats_per_bar)
-            ET.SubElement(tm, "beat-type").text = "4"
+            ET.SubElement(tm, "beat-type").text = str(args.beat_type)
             ET.SubElement(attr, "staves").text = "2"
             c1 = ET.SubElement(attr, "clef", number="1")
             ET.SubElement(c1, "sign").text = "G"; ET.SubElement(c1, "line").text = "2"
@@ -544,10 +660,11 @@ def main() -> None:
             d_top = ET.SubElement(m_el, "direction", placement="above", system="only-top")
             ET.SubElement(ET.SubElement(d_top, "direction-type"), "words", {"font-weight": "bold", "font-size": "11", "relative-y": "24"}).text = "Moderato espressivo"
             met = ET.SubElement(ET.SubElement(d_top, "direction-type"), "metronome", {"parentheses": "no", "relative-y": "24", "default-x": "12"})
-            ET.SubElement(met, "beat-unit").text = "quarter"
+            ET.SubElement(met, "beat-unit").text = "eighth" if args.beat_type == 8 else "quarter"
             ET.SubElement(met, "per-minute").text = str(int(round(args.bpm)))
             ET.SubElement(d_top, "staff").text = "1"
-            ET.SubElement(d_top, "sound", tempo=str(round(args.bpm, 2)))
+            quarter_bpm = args.bpm * (4.0 / args.beat_type)
+            ET.SubElement(d_top, "sound", tempo=str(round(quarter_bpm, 2)))
 
         if b == 1:
             dp = ET.SubElement(m_el, "direction", placement="below")
@@ -559,23 +676,32 @@ def main() -> None:
             ET.SubElement(ET.SubElement(ET.SubElement(dd, "direction-type"), "dynamics", {"relative-y": "-18"}), val)
             ET.SubElement(dd, "staff").text = "1"
 
-        rh_v1, rh_v2 = simplify_bar_hand(bars_map.get((b, 1), []), b, b_global, bar_len, slot_rms)
-        lh_v1, lh_v2 = simplify_bar_hand(bars_map.get((b, 2), []), b, b_global, bar_len, slot_rms)
+        rh_v1, rh_v2 = simplify_bar_hand(bars_map.get((b, 1), []), b, b_global, bar_len, slot_rms, divisions)
+        lh_v1, lh_v2 = simplify_bar_hand(bars_map.get((b, 2), []), b, b_global, bar_len, slot_rms, divisions)
 
         def emit_staff(v1: list[ChordEvent], v2: list[ChordEvent] | None, staff: int, v_id1: int, v_id2: int) -> None:
             acc_state: dict[tuple[str, int], int] = {}
             if not v1 and not v2:
-                n = ET.SubElement(m_el, "note")
                 if b == 0:
-                    ET.SubElement(n, "rest")
-                    ET.SubElement(n, "duration").text = str(bar_len)
-                    ET.SubElement(n, "voice").text = str(v_id1)
-                    ET.SubElement(n, "type").text = "quarter" if bar_len == 2 else "eighth"
+                    for _, pd, pt, pdot, ptup in split_duration(0, bar_len, True, divisions, beat_slots):
+                        n = ET.SubElement(m_el, "note")
+                        ET.SubElement(n, "rest")
+                        ET.SubElement(n, "duration").text = str(pd)
+                        ET.SubElement(n, "voice").text = str(v_id1)
+                        ET.SubElement(n, "type").text = pt
+                        if pdot:
+                            ET.SubElement(n, "dot")
+                        if ptup:
+                            tmod = ET.SubElement(n, "time-modification")
+                            ET.SubElement(tmod, "actual-notes").text = str(ptup[0])
+                            ET.SubElement(tmod, "normal-notes").text = str(ptup[1])
+                        ET.SubElement(n, "staff").text = str(staff)
                 else:
+                    n = ET.SubElement(m_el, "note")
                     ET.SubElement(n, "rest", measure="yes")
                     ET.SubElement(n, "duration").text = str(bar_len)
                     ET.SubElement(n, "voice").text = str(v_id1)
-                ET.SubElement(n, "staff").text = str(staff)
+                    ET.SubElement(n, "staff").text = str(staff)
                 return
 
             def write_atoms(atoms: list[RenderedAtom], voice: int, stem: str | None) -> None:
@@ -590,6 +716,10 @@ def main() -> None:
                         ET.SubElement(n, "type").text = at.type_str
                         if at.dotted:
                             ET.SubElement(n, "dot")
+                        if at.tuplet:
+                            tmod = ET.SubElement(n, "time-modification")
+                            ET.SubElement(tmod, "actual-notes").text = str(at.tuplet[0])
+                            ET.SubElement(tmod, "normal-notes").text = str(at.tuplet[1])
                         ET.SubElement(n, "staff").text = str(staff)
                     else:
                         for idx, (midi, ts, te, arp) in enumerate(at.pitches):
@@ -618,11 +748,17 @@ def main() -> None:
                                 acc_state[(step, octv)] = alter
                             elif not ts:
                                 acc_state[(step, octv)] = alter
+                            if at.tuplet:
+                                tmod = ET.SubElement(n, "time-modification")
+                                ET.SubElement(tmod, "actual-notes").text = str(at.tuplet[0])
+                                ET.SubElement(tmod, "normal-notes").text = str(at.tuplet[1])
                             if stem:
                                 ET.SubElement(n, "stem").text = stem
                             ET.SubElement(n, "staff").text = str(staff)
-                            if idx == 0 and at.beam:
-                                ET.SubElement(n, "beam", number="1").text = at.beam
+                            if idx == 0 and at.beam1:
+                                ET.SubElement(n, "beam", number="1").text = at.beam1
+                            if idx == 0 and at.beam2:
+                                ET.SubElement(n, "beam", number="2").text = at.beam2
                             if ts or te or arp:
                                 nts = ET.SubElement(n, "notations")
                                 if ts:
@@ -632,10 +768,10 @@ def main() -> None:
                                 if arp:
                                     ET.SubElement(nts, "arpeggiate")
 
-            write_atoms(build_voice_atoms(v1, bar_len, v2), v_id1, "up" if v2 else None)
+            write_atoms(build_voice_atoms(v1, bar_len, v2, divisions, beat_slots, beam_group_slots), v_id1, "up" if v2 else None)
             if v2:
                 ET.SubElement(ET.SubElement(m_el, "backup"), "duration").text = str(bar_len)
-                write_atoms(build_voice_atoms(v2, bar_len, v1), v_id2, "down")
+                write_atoms(build_voice_atoms(v2, bar_len, v1, divisions, beat_slots, beam_group_slots), v_id2, "down")
 
         emit_staff(rh_v1, rh_v2, 1, 1, 2)
         ET.SubElement(ET.SubElement(m_el, "backup"), "duration").text = str(bar_len)

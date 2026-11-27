@@ -34,11 +34,16 @@ if (-not (Test-Path "config.json")) {
 }
 
 if ($InstallTools) {
-    $msCandidates = @(
+    $msCandidates = @()
+    if ($env:MUSCRIPTOR_MUSESCORE) { $msCandidates += $env:MUSCRIPTOR_MUSESCORE }
+    $msCandidates += @(
         "C:\Program Files\MuseScore 4\bin\MuseScore4.exe",
         "C:\Program Files (x86)\MuseScore 4\bin\MuseScore4.exe",
-        "E:\AI\Playground\PianoTranscription\tools\MuseScorePortable\App\MuseScore\bin\MuseScore4.exe"
+        (Join-Path $Root "assets_local\musescore\bin\MuseScore4.exe")
     )
+    if ($env:LOCALAPPDATA) {
+        $msCandidates += (Join-Path $env:LOCALAPPDATA "Programs\MuseScore 4\bin\MuseScore4.exe")
+    }
     $msFound = ($msCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1)
     if (-not $msFound) {
         $msCmd = Get-Command MuseScore4, mscore, musescore -ErrorAction SilentlyContinue | Select-Object -First 1
