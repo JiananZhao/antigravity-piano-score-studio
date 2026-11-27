@@ -33,6 +33,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tempo_map import TempoMap, load_tempo_map
 from style_analyzer import load_style_profile
+from bar_repair_loop import apply_bar_overrides_to_notes, load_bar_overrides
 
 DIVISIONS = 2  # Default divisions per quarter note (2 = eighth-note grid)
 
@@ -591,6 +592,7 @@ def main() -> None:
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--dynamics-csv", default=None)
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
+    ap.add_argument("--bar-overrides", default=None, help="Optional project_manifest.json or bar_overrides JSON for local per-bar fixes")
     ap.add_argument("--musescore", default=None)
     ap.add_argument("--out-xml", required=True)
     ap.add_argument("--out-pdf", default=None)
@@ -616,6 +618,11 @@ def main() -> None:
     enable_gap_bridging = bool(eng_cfg.get("enable_gap_bridging", True))
     bridge_rms_db = float(eng_cfg.get("bridge_rms_db", -38.0))
     anchor_min_dur_beats = float(eng_cfg.get("anchor_min_dur_beats", 1.5))
+    bar_overrides = load_bar_overrides(args.bar_overrides)
+    if bar_overrides:
+        ov_stats = apply_bar_overrides_to_notes(notes, bar_slots, pickup_start, bar_overrides)
+        if ov_stats["dropped"] or ov_stats["rehanded"]:
+            print(f"Stage 3 applied bar_overrides: dropped={ov_stats['dropped']}, rehanded={ov_stats['rehanded']}")
     bars_map, max_bar = slice_into_bars(notes, pickup_start, bar_slots)
 
     pc_table = FLAT_PC_SPELLING if args.key_fifths <= 0 else SHARP_PC_SPELLING
@@ -713,13 +720,15 @@ def main() -> None:
             ET.SubElement(ET.SubElement(ET.SubElement(dd, "direction-type"), "dynamics", {"relative-y": "-18"}), val)
             ET.SubElement(dd, "staff").text = "1"
 
+        bar_ov = bar_overrides.get(b, {})
+        bar_bridge = bool(bar_ov.get("enable_gap_bridging", enable_gap_bridging))
         rh_v1, rh_v2 = simplify_bar_hand(
             bars_map.get((b, 1), []), b, b_global, bar_len, slot_rms, divisions,
-            enable_gap_bridging=enable_gap_bridging, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
+            enable_gap_bridging=bar_bridge, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
         )
         lh_v1, lh_v2 = simplify_bar_hand(
             bars_map.get((b, 2), []), b, b_global, bar_len, slot_rms, divisions,
-            enable_gap_bridging=enable_gap_bridging, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
+            enable_gap_bridging=bar_bridge, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
         )
 
         def emit_staff(v1: list[ChordEvent], v2: list[ChordEvent] | None, staff: int, v_id1: int, v_id2: int) -> None:
