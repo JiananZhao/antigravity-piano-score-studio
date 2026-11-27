@@ -262,6 +262,7 @@ def test_v3_manifest_roundtrip_and_transkun_quantization(tmp_path: Path) -> None
 def test_krumhansl_schmuckler_key_detection() -> None:
     """Verify Krumhansl-Schmuckler detects C major, A minor, and Bb major accurately."""
     sa = _load_script("style_analyzer.py")
+    detect_key_krumhansl_schmuckler = sa.detect_key_krumhansl_schmuckler
 
     # C major: strong C-E-G-F-G-C cadence
     c_maj_notes = [
@@ -270,14 +271,14 @@ def test_krumhansl_schmuckler_key_detection() -> None:
         (67, 2.0, 3.0, 84), (71, 2.0, 3.0, 80), (62, 2.0, 3.0, 76),
         (60, 3.0, 5.0, 95), (64, 3.0, 5.0, 84), (67, 3.0, 5.0, 82),
     ]
-    res_c = sa.detect_key_krumhansl_schmuckler(c_maj_notes)
+    res_c = detect_key_krumhansl_schmuckler(c_maj_notes)
     assert res_c["key_name"] == "C major"
     assert res_c["key_fifths"] == 0
     assert res_c["confidence"] > 0.7
 
     # Bb major (key_fifths = -2)
     bb_maj_notes = [(p - 2, s, e, v) for p, s, e, v in c_maj_notes]
-    res_bb = sa.detect_key_krumhansl_schmuckler(bb_maj_notes)
+    res_bb = detect_key_krumhansl_schmuckler(bb_maj_notes)
     assert res_bb["key_name"] == "Bb major"
     assert res_bb["key_fifths"] == -2
 
@@ -288,7 +289,7 @@ def test_krumhansl_schmuckler_key_detection() -> None:
         (64, 3.0, 4.0, 85), (68, 3.0, 4.0, 80), (59, 3.0, 4.0, 78),
         (57, 4.0, 6.0, 95), (60, 4.0, 6.0, 84), (64, 4.0, 6.0, 82),
     ]
-    res_am = sa.detect_key_krumhansl_schmuckler(a_min_notes)
+    res_am = detect_key_krumhansl_schmuckler(a_min_notes)
     assert res_am["key_name"] == "A minor"
     assert res_am["key_fifths"] == 0
     assert res_am["mode"] == "minor"
@@ -297,6 +298,7 @@ def test_krumhansl_schmuckler_key_detection() -> None:
 def test_musical_dna_and_style_classification() -> None:
     """Verify 6-dim Musical DNA classifies Pop, Classical Rubato, Baroque, and Jazz distinctly."""
     sa = _load_script("style_analyzer.py")
+    classify_style_profile, extract_musical_dna = sa.classify_style_profile, sa.extract_musical_dna
 
     # 1. Pop Ballad: steady tempo, diatonic block chords, quarter/half notes
     pop_notes = []
@@ -306,8 +308,8 @@ def test_musical_dna_and_style_classification() -> None:
             pop_notes.append((p, b0, b0 + 2.0, 80))
         for p in (53, 57, 60, 65, 69):
             pop_notes.append((p, b0 + 2.0, b0 + 4.0, 80))
-    dna_pop = sa.extract_musical_dna(pop_notes, tempo_map_dict={"bar_tempos_bpm": [72.0] * 8})
-    prof_pop, _, _, _ = sa.classify_style_profile(dna_pop)
+    dna_pop = extract_musical_dna(pop_notes, tempo_map_dict={"bar_tempos_bpm": [72.0] * 8})
+    prof_pop, _, _, _ = classify_style_profile(dna_pop)
     assert prof_pop == "pop_ballad"
 
     # 2. Classical Romantic: strong rubato tempo_cv + expressive 16th-note runs
@@ -318,8 +320,8 @@ def test_musical_dna_and_style_classification() -> None:
         for k in range(8):
             cl_notes.append((60 + (k % 7), b0 + k * 0.25, b0 + (k + 1) * 0.25, 84))
     rubato_bpms = [62.0, 68.0, 78.0, 84.0, 74.0, 64.0, 80.0, 60.0]
-    dna_cl = sa.extract_musical_dna(cl_notes, tempo_map_dict={"bar_tempos_bpm": rubato_bpms})
-    prof_cl, _, _, _ = sa.classify_style_profile(dna_cl)
+    dna_cl = extract_musical_dna(cl_notes, tempo_map_dict={"bar_tempos_bpm": rubato_bpms})
+    prof_cl, _, _, _ = classify_style_profile(dna_cl)
     assert prof_cl == "classical_romantic"
 
     # 3. Baroque Polyphonic: steady tempo + continuous 16th notes + staggered overlapping voices
@@ -329,8 +331,8 @@ def test_musical_dna_and_style_classification() -> None:
         baroque_notes.append((72 + (step % 5), t, t + 0.5, 82))
         if step % 2 == 1:
             baroque_notes.append((55 + (step % 4), t, t + 0.75, 80))
-    dna_bq = sa.extract_musical_dna(baroque_notes, tempo_map_dict={"bar_tempos_bpm": [96.0] * 8})
-    prof_bq, _, _, _ = sa.classify_style_profile(dna_bq)
+    dna_bq = extract_musical_dna(baroque_notes, tempo_map_dict={"bar_tempos_bpm": [96.0] * 8})
+    prof_bq, _, _, _ = classify_style_profile(dna_bq)
     assert prof_bq == "baroque_polyphonic"
 
     # 4. Jazz Groove: swing long-short eighths (0.67 / 0.33) + chromatic extensions + off-beat syncopation
@@ -340,8 +342,8 @@ def test_musical_dna_and_style_classification() -> None:
         t_sw = t0 + 0.67
         jazz_notes.append((60 + (beat % 12), t0, t0 + 0.60, 86))
         jazz_notes.append((63 + ((beat * 5) % 12), t_sw, t_sw + 0.28, 82))
-    dna_jz = sa.extract_musical_dna(jazz_notes, tempo_map_dict={"bar_tempos_bpm": [128.0] * 6})
-    prof_jz, _, _, _ = sa.classify_style_profile(dna_jz)
+    dna_jz = extract_musical_dna(jazz_notes, tempo_map_dict={"bar_tempos_bpm": [128.0] * 6})
+    prof_jz, _, _, _ = classify_style_profile(dna_jz)
     assert prof_jz == "jazz_groove"
 
 
@@ -349,15 +351,107 @@ def test_style_profiles_and_dynamic_eval_rubric() -> None:
     """Verify all 4 declarative profiles load cleanly and adapt eval_gate_runner static dynamics."""
     sa = _load_script("style_analyzer.py")
     eg = _load_script("eval_gate_runner.py")
+    evaluate_s4_r1_static_dynamics = eg.evaluate_s4_r1_static_dynamics
+    VALID_PROFILES, load_style_profile = sa.VALID_PROFILES, sa.load_style_profile
 
     required_sections = {"transcription", "pitch_audit", "engraving", "dynamics", "eval_rubric"}
-    for pid in sa.VALID_PROFILES:
-        prof = sa.load_style_profile(pid)
+    for pid in VALID_PROFILES:
+        prof = load_style_profile(pid)
         assert prof["profile_id"] == pid
         assert required_sections.issubset(prof.keys())
 
     # Balanced Baroque counterpoint (rh_med=84, lh_med=82, lh_max=98) fails legacy Pop rubric
     # but PASSES under baroque_polyphonic dynamic rubric.
-    assert eg.evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0) == "FAIL"
-    baroque_rubric = sa.load_style_profile("baroque_polyphonic")["eval_rubric"]
-    assert eg.evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0, eval_rubric=baroque_rubric) == "PASS"
+    assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0) == "FAIL"
+    baroque_rubric = load_style_profile("baroque_polyphonic")["eval_rubric"]
+    assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0, eval_rubric=baroque_rubric) == "PASS"
+
+
+def test_chroma_flux_dynamic_pedal_styles() -> None:
+    """Verify dry Baroque omits sustain, Jazz uses half-pedal, and Pop lifts on mid-bar harmony change."""
+    pv = _load_script("pedal_and_velocity.py")
+    tm = _load_script("tempo_map.py")
+
+    tmap = tm.TempoMap(bpm=120.0, beats_per_bar=4, beat_type=4, first_downbeat=0.0, mode="fixed-tempo")
+    # Bar 1: Beat 1-2 C major (C,E,G), Beat 3-4 F# major (F#,A#,C#) -> strong mid-bar chroma flux!
+    notes = [
+        {"st": 0.0, "pitch": 60}, {"st": 0.0, "pitch": 64}, {"st": 0.0, "pitch": 67},
+        {"st": 1.0, "pitch": 66}, {"st": 1.0, "pitch": 70}, {"st": 1.0, "pitch": 73},
+    ]
+
+    # 1. Baroque dry_articulated: zero CC64 > 0 events
+    dry = pv.compute_dynamic_pedal_events(notes, tmap, max_bar=1, rate=48000, pedal_style="dry_articulated")
+    assert all(ev["value"] == 0 for ev in dry)
+
+    # 2. Pop legato_harmonic: should trigger BOTH bar-start pedal AND mid-bar chord-change pedal lift
+    pop = pv.compute_dynamic_pedal_events(notes, tmap, max_bar=1, rate=48000, pedal_style="legato_harmonic")
+    on_evs = [ev for ev in pop if ev["value"] > 0]
+    assert len(on_evs) >= 2
+    assert any(ev["value"] == 127 for ev in on_evs)
+
+    # 3. Jazz rhythmic_half_pedal: uses half-pedal depth (<= 80)
+    jazz = pv.compute_dynamic_pedal_events(notes, tmap, max_bar=1, rate=48000, pedal_style="rhythmic_half_pedal")
+    jazz_on = [ev for ev in jazz if ev["value"] > 0]
+    assert len(jazz_on) >= 1
+    assert all(ev["value"] <= 80 for ev in jazz_on)
+
+
+def test_transkun_velocity_fusion_and_flat_fallback() -> None:
+    """Verify real TransKun velocities blend with acoustic velocities while flat placeholders are skipped."""
+    pv = _load_script("pedal_and_velocity.py")
+
+    notes = [
+        {"st": 0.50, "pitch": 60, "staff": 1, "calc_vel": 64},
+        {"st": 1.00, "pitch": 64, "staff": 1, "calc_vel": 64},
+        {"st": 1.50, "pitch": 48, "staff": 2, "calc_vel": 64},
+    ]
+    # Flat placeholder MIDI (std = 0) should be skipped
+    flat_events = [(0.50, 60, 100), (1.00, 64, 100), (1.50, 48, 100)]
+    assert pv.fuse_transkun_velocities(notes, flat_events) == 0
+    assert [n["calc_vel"] for n in notes] == [64, 64, 64]
+
+    # Real expressive TransKun velocities should blend & respect lh_ceiling_vel=78
+    real_events = [(0.51, 60, 96), (0.99, 64, 42), (1.51, 48, 110)]
+    fused = pv.fuse_transkun_velocities(notes, real_events, alpha=0.55, lh_ceiling_vel=78)
+    assert fused == 3
+    assert notes[0]["calc_vel"] > 75
+    assert notes[1]["calc_vel"] < 58
+    assert notes[2]["calc_vel"] <= 78
+
+
+def test_bar_overrides_application_and_repair_proposal(tmp_path: Path) -> None:
+    """Verify bar_overrides drops/re-hands notes per bar and proposes fixes for wide-span chords."""
+    br = _load_script("bar_repair_loop.py")
+    s3 = _load_script("stage3_engrave_study_score.py")
+
+    notes = [
+        s3.RawNote(start_slot=0, dur=2, pitch=60, hand=1),
+        s3.RawNote(start_slot=0, dur=2, pitch=61, hand=1),  # ghost to drop in bar 1
+        s3.RawNote(start_slot=8, dur=2, pitch=62, hand=1),  # re-hand to LH in bar 2
+    ]
+    overrides = {
+        1: {"drop_pitches": [61]},
+        2: {"force_hand": {"62": 2}},
+    }
+    stats = br.apply_bar_overrides_to_notes(notes, bar_slots=8, pickup_start=0, overrides=overrides)
+    assert stats == {"dropped": 1, "rehanded": 1}
+    assert [n.pitch for n in notes] == [60, 62]
+    assert notes[1].hand == 2
+
+    # Propose fix for an unmarked >12st RH chord in Bar 2 (C4=60 + D5=74 -> span 14)
+    xml_text = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part id="P1">
+    <measure number="2">
+      <attributes><divisions>2</divisions></attributes>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>2</duration><voice>1</voice><staff>1</staff></note>
+      <note><chord/><pitch><step>D</step><octave>5</octave></pitch><duration>2</duration><voice>1</voice><staff>1</staff></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+    xml_path = tmp_path / "wide.musicxml"
+    xml_path.write_text(xml_text, encoding="utf-8")
+    proposals = br.propose_bar_repairs(None, {"confirmed_ghost_count": 0}, xml_path)
+    assert "2" in proposals
+    assert proposals["2"]["force_hand"]["60"] == 2
