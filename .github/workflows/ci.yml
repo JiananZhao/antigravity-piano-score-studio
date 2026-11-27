@@ -34,6 +34,7 @@ jobs:
       - name: CLI --help smoke test on all scripts
         run: |
           python piano_studio.py --help > /dev/null
+          python skills/piano-score-studio/scripts/style_analyzer.py --help > /dev/null
           for script in skills/piano-score-studio/scripts/*.py; do
             echo "Checking --help for $script"
             python "$script" --help > /dev/null

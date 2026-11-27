@@ -1,0 +1,45 @@
+{
+  "profile_id": "jazz_groove",
+  "display_name": "Jazz / Swing & Syncopated Solo Piano",
+  "description": "High syncopation, swing eighth feel, extended chromatic/shell voicings with real minor-2nd clusters, and rhythmic off-beat accents.",
+  "transcription": {
+    "default_grid": 3,
+    "tempo_mode_preference": "auto",
+    "allow_swing": true
+  },
+  "pitch_audit": {
+    "ghost_f0_gap_db": 16.0,
+    "ghost_og_db": 2.0,
+    "weak_oos_snr_db": 10.0,
+    "allow_chromatic_clusters": true
+  },
+  "engraving": {
+    "split_center": 61.0,
+    "lh_max_pitch": 67,
+    "rh_min_pitch": 55,
+    "max_hand_span": 12,
+    "enable_gap_bridging": false,
+    "bridge_rms_db": -28.0,
+    "anchor_min_dur_beats": 1.5,
+    "max_voices_per_hand": 2
+  },
+  "dynamics": {
+    "pedal_style": "rhythmic_half_pedal",
+    "target_rh_lh_diff_db": 1.5,
+    "lh_ceiling_vel": 100
+  },
+  "eval_rubric": {
+    "s1_min_circular_r_pass": 0.50,
+    "s1_max_drift_ms_pass": 50.0,
+    "s1_require_downbeat_peak": false,
+    "s1_spurious_16_pass_pct": 15.0,
+    "s1_spurious_16_warn_pct": 30.0,
+    "s3_max_spurious_16_pass": 20,
+    "s3_max_spurious_16_warn": 50,
+    "s3_max_rests_per_bar_pass": 4.0,
+    "s3_max_rests_per_bar_warn": 6.5,
+    "s3_max_mid_clef_changes_pass": 1,
+    "s4_max_lh_vel_pass": 104,
+    "s4_min_rh_lh_diff_pass": 0
+  }
+}

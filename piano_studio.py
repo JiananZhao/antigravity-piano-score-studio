@@ -73,7 +73,8 @@ def main() -> None:
     ap.add_argument("--beat-type", type=int, default=None, choices=(4, 8), help="Optional time-signature denominator")
     ap.add_argument("--first-downbeat", type=float, default=None, help="Optional Bar 1 downbeat timestamp (sec)")
     ap.add_argument("--grid", type=int, default=None, choices=(2, 3, 4), help="Optional quantization grid (2/3/4)")
-    ap.add_argument("--key-fifths", type=int, default=-2, help="Key signature fifths (-7..+7, e.g. 0=C, -2=Bb)")
+    ap.add_argument("--style", default="auto", choices=("auto", "pop_ballad", "classical_romantic", "baroque_polyphonic", "jazz_groove"), help="Style profile (default: auto via 6-dim Musical DNA)")
+    ap.add_argument("--key-fifths", type=int, default=None, help="Optional manual key signature fifths (-7..+7); auto-detected via Krumhansl-Schmuckler when omitted")
     ap.add_argument("--config", default=None, help="Optional config.json path")
     ap.add_argument("--musescore", default=None, help="Optional MuseScore 4 binary path")
     ap.add_argument("--analyze-only", action="store_true", help="Stop after Stage 0 triage + Stage 1 calibration")
@@ -208,9 +209,43 @@ def main() -> None:
     btype = str(s1["beat_type"])
     t0 = str(s1["first_downbeat"])
     grid = str(s1["grid"])
-    key_fifths = str(s1.get("key_fifths", args.key_fifths))
     baseline_mid = Path(manifest["artifacts"]["score_mid"])
     baseline_xml = manifest["artifacts"].get("score_musicxml")
+
+    # Stage 1.5: Auto Key Detection (Krumhansl-Schmuckler) & 6-Dim Musical DNA Style Analysis
+    style_json = analysis_dir / "style_analysis.json"
+    if not (args.resume and is_stage_done(manifest, "stage1_5_style_analysis") and style_json.is_file()):
+        _run_step(
+            "Stage 1.5: Key Detection & 6-Dim Musical DNA Style Analysis",
+            [
+                py,
+                str(SCRIPTS_DIR / "style_analyzer.py"),
+                "--midi",
+                str(baseline_mid),
+                "--stage1-cal",
+                str(cal_json),
+                "--beats-per-bar",
+                bpb,
+                "--beat-type",
+                btype,
+                "--style",
+                args.style,
+                "--out",
+                str(style_json),
+            ],
+        )
+        st_data = json.loads(style_json.read_text(encoding="utf-8"))
+        manifest["style_profile"] = st_data["selected_profile"]
+        manifest["style_profile_path"] = st_data["profile_path"]
+        manifest["musical_dna"] = st_data["musical_dna"]
+        manifest["detected_key"] = st_data["detected_key"]
+        manifest["artifacts"]["style_analysis_json"] = str(style_json)
+        set_stage_status(manifest, "stage1_5_style_analysis", "done")
+        save_manifest(manifest_path, manifest)
+
+    style_profile_arg = manifest.get("style_profile_path") or manifest.get("style_profile") or "pop_ballad"
+    resolved_key_fifths = args.key_fifths if args.key_fifths is not None else int((manifest.get("detected_key") or {}).get("key_fifths", 0))
+    key_fifths = str(resolved_key_fifths)
 
     # Stage 2: Harmonic Pitch & Ghost Audit (+ automatic --clean-midi)
     midi_for_stage3 = baseline_mid
@@ -239,6 +274,10 @@ def main() -> None:
                     str(baseline_mid),
                     "--clean-midi",
                     str(cleaned_mid),
+                    "--style-profile",
+                    str(style_profile_arg),
+                    "--key-fifths",
+                    key_fifths,
                     "--out",
                     str(pitch_audit_json),
                 ],
@@ -311,6 +350,8 @@ def main() -> None:
             key_fifths,
             "--dynamics-csv",
             str(dynamics_csv),
+            "--style-profile",
+            str(style_profile_arg),
             "--out-xml",
             str(study_xml),
         ]
@@ -424,6 +465,8 @@ def main() -> None:
                 t0,
                 "--stage1-cal",
                 str(cal_json),
+                "--style-profile",
+                str(style_profile_arg),
                 "--out",
                 str(eval_json),
             ]
