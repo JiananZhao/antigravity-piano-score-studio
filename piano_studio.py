@@ -525,7 +525,10 @@ def main() -> None:
                 print(f"\nPipeline finished with Eval Gate warnings/failures. Inspect: {eval_json}")
                 sys.exit(proc.returncode)
         else:
-            set_stage_status(manifest, "stage5_ab_and_eval", "done")
+            reason = "missing_study_pdf" if not study_pdf.is_file() else "missing_pitch_audit"
+            print(f"\n[SKIPPED] Stage 5.2 Eval Gate skipped ({reason}).")
+            manifest["stage5_eval_skip_reason"] = reason
+            set_stage_status(manifest, "stage5_ab_and_eval", "skipped")
             save_manifest(manifest_path, manifest)
 
     print(f"\nPiano Score Studio v3.0 complete! Manifest: {manifest_path}")

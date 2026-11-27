@@ -455,3 +455,116 @@ def test_bar_overrides_application_and_repair_proposal(tmp_path: Path) -> None:
     proposals = br.propose_bar_repairs(None, {"confirmed_ghost_count": 0}, xml_path)
     assert "2" in proposals
     assert proposals["2"]["force_hand"]["60"] == 2
+
+
+def test_p0_1_stage2_clean_midi_nonzero_downbeat_and_rubato(tmp_path: Path) -> None:
+    """P0-1 regression: clean_ghost_notes_from_midi must match audio t_on when first_downbeat != 0."""
+    s2 = _load_script("stage2_pitch_audit.py")
+    tm = _load_script("tempo_map.py")
+
+    # Quantized score MIDI: Bar 1 beat 1 sits at tick 0 (even though audio first_downbeat = 1.30 s)
+    mid = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    mid.tracks.append(tr)
+    tr.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))  # 120 BPM
+    tr.append(mido.Message("note_on", note=60, velocity=85, time=0))
+    tr.append(mido.Message("note_on", note=61, velocity=35, time=0))  # ghost C#4 at Bar 1 beat 1 -> audio 1.30s
+    tr.append(mido.Message("note_off", note=60, velocity=0, time=480))
+    tr.append(mido.Message("note_off", note=61, velocity=0, time=0))
+    tr.append(mido.MetaMessage("end_of_track", time=0))
+
+    in_mid = tmp_path / "score.mid"
+    out_mid = tmp_path / "score_cleaned.mid"
+    mid.save(str(in_mid))
+
+    tmap = tm.TempoMap(bpm=120.0, beats_per_bar=4, beat_type=4, first_downbeat=1.30, mode="fixed-tempo")
+    removed = s2.clean_ghost_notes_from_midi(
+        in_mid, out_mid, [{"weaker_midi": 61, "t_on": 1.30}], tempo_map=tmap, has_pickup=False
+    )
+    assert removed == 1
+    cleaned = mido.MidiFile(str(out_mid))
+    remaining = [m.note for t in cleaned.tracks for m in t if m.type == "note_on" and m.velocity > 0]
+    assert remaining == [60]
+
+
+def test_p0_2_stage3_reconcile_cross_bar_ties_zero_orphans() -> None:
+    """P0-2 regression: truncated cross-bar note in chord must not leave orphan tie_stop in next bar."""
+    s3 = _load_script("stage3_engrave_study_score.py")
+
+    # RH Bar 1: E5(76) lasts 6 beats (12 slots @ div=2, crosses barline into Bar 2),
+    # simultaneous short C5(72) dur=2, plus new onset D5(74) at slot 2 truncating Bar 1 chord.
+    notes = [
+        s3.RawNote(start_slot=0, dur=12, pitch=76, hand=1),
+        s3.RawNote(start_slot=0, dur=2, pitch=72, hand=1),
+        s3.RawNote(start_slot=2, dur=2, pitch=74, hand=1),
+    ]
+    bars_map, max_bar = s3.slice_into_bars(notes, pickup_start=0, bar_slots=8)
+    slot_rms = np.full(32, -60.0)
+    bar_voices = {}
+    for b in range(1, max_bar + 1):
+        bar_voices[(b, 1)] = s3.simplify_bar_hand(bars_map.get((b, 1), []), b, (b - 1) * 8, 8, slot_rms, 2)
+        bar_voices[(b, 2)] = ([], None)
+    s3.reconcile_cross_bar_ties(bar_voices, start_bar=1, max_bar=max_bar, bar_slots=8, pickup_start=0)
+
+    # Count outgoing tie_starts vs incoming tie_stops across all bars -> must balance strictly
+    starts = sum(1 for (b, _), (v1, v2) in bar_voices.items() for ev in (v1 + (v2 or [])) for seg in ev.segs if seg.tie_start)
+    stops = sum(1 for (b, _), (v1, v2) in bar_voices.items() for ev in (v1 + (v2 or [])) for seg in ev.segs if seg.tie_stop)
+    assert starts == stops
+
+
+def test_p0_3_stage3_no_false_pickup_on_leading_rest(tmp_path: Path) -> None:
+    """P0-3 regression: when Stage 1 reports has_pickup=False, a Beat 2 entry must NOT become Bar 0."""
+    s3 = _load_script("stage3_engrave_study_score.py")
+
+    mid = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    mid.tracks.append(tr)
+    # First note starts on Beat 2 (tick 480 = slot 2 at div=2) in a 4/4 bar (bar_slots=8)
+    tr.append(mido.Message("note_on", note=64, velocity=80, time=480))
+    tr.append(mido.Message("note_off", note=64, velocity=0, time=480))
+    tr.append(mido.MetaMessage("end_of_track", time=0))
+    mid_path = tmp_path / "leading_rest.mid"
+    mid.save(str(mid_path))
+
+    _, pickup_start = s3.load_midi_notes(mid_path, divisions=2, bar_slots=8, has_pickup=False)
+    assert pickup_start == 0
+
+
+def test_p0_4_compound_6_8_eighth_plus_quarter_not_split() -> None:
+    """P0-4 regression: 6/8 eighth + quarter + dotted-quarter should emit a clean quarter (not tied eighths)."""
+    s3 = _load_script("stage3_engrave_study_score.py")
+
+    # 6/8 at div=2 -> beat_slots=3. Quarter note starting on 2nd eighth (slot=1, dur=2)
+    pieces = s3.split_duration(slot=1, dur=2, is_rest=False, divisions=2, beat_slots=3)
+    assert len(pieces) == 1
+    assert pieces[0][1] == 2 and pieces[0][2] == "quarter"
+
+    # 6/8 at div=4 -> beat_slots=6. Quarter note starting on 2nd eighth (slot=2, dur=4)
+    pieces4 = s3.split_duration(slot=2, dur=4, is_rest=False, divisions=4, beat_slots=6)
+    assert len(pieces4) == 1
+    assert pieces4[0][1] == 4 and pieces4[0][2] == "quarter"
+
+
+def test_p1_1_and_p1_3_rubato_grid_coverage_and_note_dedup(tmp_path: Path) -> None:
+    """P1-1 & P1-3 regression: rubato grid uses TempoMap.sec_to_q, and quantize_performance_midi deduplicates."""
+    s1 = _load_script("stage1_tempo_and_transcribe.py")
+    tm = _load_script("tempo_map.py")
+    te = _load_script("transcription_engines.py")
+
+    # Strongly accelerating rubato beats: 8th-note onsets exactly on rubato grid
+    q_beats = np.array([0.0, 0.80, 1.50, 2.10, 2.60, 3.05, 3.45, 3.85, 4.25], dtype=np.float64)
+    q_grid = np.arange(len(q_beats), dtype=np.float64)
+    tmap = tm.TempoMap(bpm=112.0, beats_per_bar=4, beat_type=4, first_downbeat=0.0, mode="tempo-map", q_grid=q_grid, t_grid=q_beats)
+    onsets = np.array([tmap.q_to_sec(k * 0.5) for k in range(16)], dtype=np.float64)
+    res_grid = s1.select_quantization_grid(onsets, quarter_bpm=112.0, first_downbeat=0.0, beat_type=4, grid_override=None, tempo_map=tmap)
+    assert res_grid["grid"] == 2
+    assert res_grid["coverage_pct_by_grid"]["2"] == 100.0
+
+    # Duplicate same-pitch notes quantizing to same slot should deduplicate cleanly
+    perf_notes = [
+        {"start_sec": 0.01, "end_sec": 0.78, "pitch": 60, "velocity": 70},
+        {"start_sec": 0.02, "end_sec": 0.79, "pitch": 60, "velocity": 92},
+    ]
+    out_mid = tmp_path / "dedup.mid"
+    q_res = te.quantize_performance_midi(perf_notes, tmap, grid=2, beats_per_bar=4, beat_type=4, out_mid=out_mid)
+    assert q_res["note_count"] == 1
