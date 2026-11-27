@@ -226,3 +226,34 @@ def test_rubato_tempo_map_stage2_and_stage4_midi_roundtrip(tmp_path: Path) -> No
     assert len(observed_onsets) == len(expected_onsets)
     for obs, exp in zip(observed_onsets, expected_onsets):
         assert abs(obs - exp) < 0.003
+
+
+def test_v3_manifest_roundtrip_and_transkun_quantization(tmp_path: Path) -> None:
+    pm = _load_script("project_manifest.py")
+    tm = _load_script("tempo_map.py")
+    te = _load_script("transcription_engines.py")
+
+    m_path = tmp_path / "project_manifest.json"
+    manifest = pm.create_manifest(["demo.wav"], tmp_path, "demo", "Demo Piece", engine="transkun")
+    pm.set_stage_status(manifest, "stage0_triage", "done")
+    pm.save_manifest(m_path, manifest)
+    loaded = pm.load_manifest(m_path)
+    assert loaded["schema_version"] == "3.0"
+    assert pm.is_stage_done(loaded, "stage0_triage")
+
+    # Quantize Rubato performance notes (including Bar 0 pickup) while preserving real velocities
+    q_beats = np.array([1.0, 1.5, 2.0, 2.5, 3.0, 3.75, 4.5, 5.25, 6.0], dtype=np.float64)
+    q_grid = np.arange(len(q_beats), dtype=np.float64)  # Bar 1 beat 1 at t=1.0s
+    tmap = tm.TempoMap(bpm=100.0, beats_per_bar=4, beat_type=4, first_downbeat=1.0, mode="tempo-map", q_grid=q_grid, t_grid=q_beats)
+    perf_notes = [
+        {"start_sec": 0.50, "end_sec": 0.95, "pitch": 67, "velocity": 52},  # Bar 0 pickup (q=-1)
+        {"start_sec": 1.01, "end_sec": 1.98, "pitch": 60, "velocity": 88},  # Bar 1 beat 1 (q=0)
+        {"start_sec": 3.02, "end_sec": 4.48, "pitch": 64, "velocity": 71},  # Bar 2 beat 1 (q=4)
+    ]
+    out_mid = tmp_path / "score.mid"
+    res = te.quantize_performance_midi(perf_notes, tmap, grid=2, beats_per_bar=4, beat_type=4, out_mid=out_mid)
+    assert res["has_pickup"] is True
+    assert res["note_count"] == 3
+    q_mid = mido.MidiFile(str(out_mid))
+    vels = [m.velocity for tr in q_mid.tracks for m in tr if m.type == "note_on" and m.velocity > 0]
+    assert vels == [52, 88, 71]
