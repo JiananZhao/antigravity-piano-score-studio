@@ -12,7 +12,7 @@
 ## 2. 六阶段流水线与命令行调用
 
 - **Stage 0（音频体检与选源）**：`scripts/stage0_audio_triage.py`
-- **Stage 1（速度/拍号/网格校准）**：圆统计 `|R|` 扫描 + 20s 分段漂移检验 + 低音/和声循环检验 + 亚拍网格直方图 → 输出基线 `score.mid` / `score.musicxml`
+- **Stage 1（速度/拍号/网格校准与转录）**：`scripts/stage1_tempo_and_transcribe.py`（`beat_this` + 圆统计 `|R|` 扫描 + 20s 分段漂移检验 + 低音/和声循环检验 + 亚拍网格选择 + `MuScriptor` 转录 → 输出 `stage1_calibration.json`、`score.mid`、`score.musicxml`）
 - **Stage 2（撞音/幽灵音/调外音谐波审计）**：`scripts/stage2_pitch_audit.py`
 - **Stage 3（学习版排谱 + 2 轮复查）**：`scripts/stage3_engrave_study_score.py` → `MuseScore4` 渲染 → 逐页视觉审查 PDF
 - **Stage 4（力度计划 → 执行 → 2 轮复查）**：`scripts/stage4_dynamics_plan.py` → `scripts/stage4_render_calibrated.py`（支持 `sfizz_render` CLI 与 `NativeHost`）

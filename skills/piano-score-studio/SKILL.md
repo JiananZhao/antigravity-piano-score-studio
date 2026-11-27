@@ -44,16 +44,22 @@ python scripts/stage0_audio_triage.py --inputs <input_dir_or_files> --out <job>/
 - **Leading-note guard**: If `first_note_sec < 0.15s`, run a 2s-silence-padded transcription check to ensure the opening note is not swallowed.
 
 ### Stage 1 — Tempo, Meter, Downbeat & Quantization Grid Calibration
-Do NOT blindly accept `beat_this` output when compound meters (`3/4` vs `6/8`) confuse it:
-- Sweep fixed-tempo circular resultant `|R|` over 10 ms onset flux and check 20s-window phase drift (`<= ±30 ms` → `--fixed-tempo`; larger rubato → `--tempo-map`).
-- Compare bass flux & harmonic change across candidate bar cycles to lock `--beats-per-bar` and `--first-downbeat`.
-- Pick the coarsest `--grid` (`2`, `3`, or `4`) covering `>= 95%` of onsets, then run transcription (e.g., via `scripts/project.py convert` or `muscriptor`).
+Do NOT blindly accept `beat_this` output when compound meters (`3/4` vs `6/8`) confuse it — run the unified calibration and transcription runner:
+```bash
+python scripts/stage1_tempo_and_transcribe.py \
+  --audio <best_audio> \
+  --triage <job>/analysis/audio_triage.json \
+  --out-dir <job>/baseline
+```
+- Runs `beat_this` (`final0`), sweeps fixed-tempo circular resultant `|R|` over 10 ms onset flux, and checks 20s-window phase drift (`<= ±30 ms` → `fixed-tempo`; larger rubato → `tempo-map`).
+- Compares bass flux (`45–260 Hz`) & 12-bin chroma harmonic change across candidate bar cycles (`4/4`, `3/4`, `6/8`, `2/4`) to lock `beats_per_bar`, `beat_type`, and `first_downbeat` (preserving Bar 0 anacrusis).
+- Picks the coarsest `--grid` (`2`, `3`, or `4`) covering `>= 95%` of onsets (re-verified on transcribed notes), applies automatic 2s leading-silence padding when `first_note_sec < 0.15s`, and writes `stage1_calibration.json`, `score_raw.mid`, `score.mid`, and `score.musicxml`. *(Use `--analyze-only` to inspect calibration before transcription, or override with `--bpm / --beats-per-bar / --beat-type / --first-downbeat / --grid`.)*
 
 ### Stage 2 — Transcription Pitch, Clash & Ghost Audit
 Run harmonic verification against the original audio before engraving:
 ```bash
 python scripts/stage2_pitch_audit.py \
-  --audio <best_audio> --xml <raw_musicxml> \
+  --audio <best_audio> --xml <job>/baseline/score.musicxml \
   --bpm <BPM> --beats-per-bar <BPB> --first-downbeat <T0> \
   --out <job>/analysis/pitch_audit.json
 ```
@@ -64,8 +70,9 @@ python scripts/stage2_pitch_audit.py \
 Engrave the cleaned study edition from the calibrated MIDI & audio:
 ```bash
 python scripts/stage3_engrave_study_score.py \
-  --midi <raw_quantized_mid> --audio <best_audio> \
+  --midi <job>/baseline/score.mid --audio <best_audio> \
   --title "<Song Title>" --bpm <BPM> --beats-per-bar <BPB> \
+  --beat-type <BEAT_TYPE> --grid <GRID> \
   --first-downbeat <T0> --key-fifths <FIFTHS> \
   --dynamics-csv <job>/analysis/bar_lh_rh_envelope.csv \
   --out-xml <job>/score/score_learning.musicxml \
