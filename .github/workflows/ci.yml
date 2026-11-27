@@ -29,10 +29,11 @@ jobs:
           pip install "numpy>=1.26" "soundfile>=0.12" "mido>=1.3" pytest
 
       - name: Static syntax compilation check (py_compile)
-        run: python -m py_compile skills/piano-score-studio/scripts/*.py
+        run: python -m py_compile piano_studio.py skills/piano-score-studio/scripts/*.py
 
       - name: CLI --help smoke test on all scripts
         run: |
+          python piano_studio.py --help > /dev/null
           for script in skills/piano-score-studio/scripts/*.py; do
             echo "Checking --help for $script"
             python "$script" --help > /dev/null
