@@ -8,7 +8,7 @@
 
 | 层级 | 组成内容 | 精确体积 | 是否直接放进 GitHub 仓库 |
 | :--- | :--- | :---: | :--- |
-| **1. 本插件代码仓库** | `plugin.json`、`SKILL.md`、检查清单、Eval 门禁、8 个跨平台脚本、安装引导 | **约 `100–160 KB`** | **是**（纯代码与文档，克隆秒下） |
+| **1. 本插件代码仓库** | `plugin.json`、`SKILL.md`、检查清单、Eval 门禁、9 个跨平台脚本、安装引导 | **约 `120–180 KB`** | **是**（纯代码与文档，克隆秒下） |
 | **2. 高音质钢琴音色 + 渲染器** | `Salamander Grand Piano V3`（FLAC 16 层采样，CC-BY 3.0）+ `sfizz`（BSD） | **约 `725 MB`**（`713.78 MB` + `11.22 MB`） | 否（通过 `./install.ps1` 或 `setup_assets.py --download-salamander` 一键自动拉取） |
 | **3. 音频转曲谱 AI 模型** | `MuScriptor medium`（1,171 MB，CC BY-NC 4.0）+ `beat_this`（77 MB） | **约 `1.25 GB`** | 否（受非商业/HF 协议约束，安装脚本引导使用者用个人 HF Token 下载） |
 | **4. 制谱与 Python 运行时** | MuseScore 4（~433 MB）+ Python/PyTorch 依赖（~2.5–3.5 GB） | **约 `3.0–4.0 GB`** | 否（本地环境安装） |
@@ -43,6 +43,7 @@ piano-transcription-studio-plugin/
         └── scripts/
             ├── setup_assets.py                      # 环境自检 & Salamander V3 开源采样一键下载解压
             ├── stage0_audio_triage.py               # Stage 0：音频体检、多版本选优、首音检测
+            ├── stage1_tempo_and_transcribe.py       # Stage 1：beat_this + 圆统计 BPM/拍号/首重拍/网格校准 + MuScriptor 转录
             ├── stage2_pitch_audit.py                # Stage 2：小二度撞音、延音幽灵音与调外音谐波审计
             ├── stage3_engrave_study_score.py        # Stage 3：通用学习版钢琴谱生成与 XML 审计
             ├── stage4_dynamics_plan.py              # Stage 4.1：LH(45-350Hz)/RH(350-3500Hz) 力度计划生成
