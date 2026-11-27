@@ -689,3 +689,18 @@ def test_p2_1_setup_assets_blocks_zip_and_tar_path_traversal(tmp_path: Path) -> 
     with zipfile.ZipFile(good_zip, "r") as zf:
         sa.safe_extract_zip(zf, dest)
     assert (dest / "sub" / "ok.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_rubato_low_circular_r_preserves_beat_this_bpm() -> None:
+    """Regression: on rubato pieces (|R| < 0.45), calibrate_bpm_and_mode must NOT multiply beat_this_bpm by 1.5x."""
+    s1 = _load_script("stage1_tempo_and_transcribe.py")
+    rng = np.random.default_rng(42)
+    # Simulate rubato onset flux over 120s where fixed-tempo circular |R| is low (< 0.25) everywhere
+    times = np.arange(0.0, 120.0, 0.01)
+    flux = rng.uniform(0.0, 1.0, size=len(times))
+    # Inject irregular rubato peaks around ~60.7 BPM
+    bt_beats = np.cumsum(rng.uniform(0.82, 1.15, size=120))
+    bt_info = {"beat_this_bpm": 60.743, "beats": bt_beats, "downbeats": bt_beats[::4]}
+    res = s1.calibrate_bpm_and_mode(times, flux, dur_s=120.0, bt_info=bt_info, bpm_override=None, mode_arg="auto")
+    assert abs(res["bpm"] - 60.743) < 1e-2
+    assert res["tempo_mode"] == "tempo-map"
