@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+AUDIO_EXTS = {".wav", ".mp3", ".flac", ".ogg"}
 
 
 def sha256_file(path: Path) -> str:
@@ -23,7 +23,13 @@ def sha256_file(path: Path) -> str:
 
 
 def analyze_audio(path: Path) -> dict:
-    info = sf.info(str(path))
+    try:
+        info = sf.info(str(path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unsupported or unreadable audio container '{path.name}' for libsndfile ({exc}). "
+            "Convert compressed formats like .m4a/.aac to WAV or FLAC first (e.g., `ffmpeg -i input.m4a output.wav`)."
+        ) from exc
     data, sr = sf.read(str(path), dtype="float64", always_2d=True)
     n_frames, n_ch = data.shape
     dur_s = n_frames / float(sr)

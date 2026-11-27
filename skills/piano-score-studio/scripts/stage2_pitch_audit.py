@@ -15,11 +15,22 @@ STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 PC_NAMES = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
 
-def parse_xml_onsets(xml_path: Path, bpm: float, beats_per_bar: int, first_downbeat: float) -> list[dict]:
+def parse_xml_onsets(
+    xml_path: Path,
+    bpm: float,
+    beats_per_bar: int,
+    first_downbeat: float,
+    beat_type: int | None = None,
+) -> list[dict]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
     divisions = int(root.findtext(".//attributes/divisions", "2"))
+    xml_beat_type = int(root.findtext(".//attributes/time/beat-type", "4"))
+    eff_beat_type = int(beat_type) if beat_type is not None else xml_beat_type
     beat_s = 60.0 / bpm
+    quarter_s = beat_s * (eff_beat_type / 4.0)
+    unit_s = quarter_s / float(divisions)
+    beat_units = max(1e-9, (divisions * 4.0) / float(eff_beat_type))
     bar_s = beats_per_bar * beat_s
 
     notes = []
@@ -53,16 +64,15 @@ def parse_xml_onsets(xml_path: Path, bpm: float, beats_per_bar: int, first_downb
                 staff = int(el.findtext("staff", "1"))
                 m_items.append((on, dur, midi, staff))
 
-        bar_len_beats = max_end / divisions if implicit else float(beats_per_bar)
-        t_bar_start = (first_downbeat - bar_len_beats * beat_s) if b == 0 else (first_downbeat + (b - 1) * bar_s)
+        t_bar_start = (first_downbeat - max_end * unit_s) if (b == 0 and implicit) else (first_downbeat + (b - 1) * bar_s)
         for on, dur, midi, staff in m_items:
-            beat_on = on / divisions
+            beat_on = on / beat_units
             notes.append(
                 {
                     "measure": b,
                     "beat": round(beat_on + 1.0, 2),
-                    "t_on": t_bar_start + beat_on * beat_s,
-                    "dur_s": (dur / divisions) * beat_s,
+                    "t_on": t_bar_start + on * unit_s,
+                    "dur_s": dur * unit_s,
                     "midi": midi,
                     "name": f"{PC_NAMES[midi % 12]}{midi // 12 - 1}",
                     "staff": staff,
@@ -108,6 +118,90 @@ def harmonic_evidence(mono: np.ndarray, sr: int, t_on: float, midi: int) -> dict
     }
 
 
+def clean_ghost_notes_from_midi(
+    in_midi: Path,
+    out_midi: Path,
+    ghosts: list[dict],
+    tol_sec: float = 0.08,
+) -> int:
+    """Remove confirmed ghost notes (matched by pitch + onset time) from a MIDI file."""
+    import mido
+
+    mid = mido.MidiFile(str(in_midi))
+    tpb = mid.ticks_per_beat
+
+    # Collect global tempo changes (tick -> tempo_us_per_beat)
+    tempo_events: list[tuple[int, int]] = [(0, 500000)]
+    for tr in mid.tracks:
+        abs_tick = 0
+        for msg in tr:
+            abs_tick += msg.time
+            if msg.type == "set_tempo":
+                tempo_events.append((abs_tick, msg.tempo))
+    tempo_events.sort(key=lambda x: x[0])
+
+    def tick_to_sec(target_tick: int) -> float:
+        sec = 0.0
+        cur_tick = 0
+        cur_tempo = 500000
+        for t_tick, tempo in tempo_events:
+            if t_tick >= target_tick:
+                break
+            if t_tick > cur_tick:
+                sec += mido.tick2second(t_tick - cur_tick, tpb, cur_tempo)
+                cur_tick = t_tick
+            cur_tempo = tempo
+        if target_tick > cur_tick:
+            sec += mido.tick2second(target_tick - cur_tick, tpb, cur_tempo)
+        return sec
+
+    remaining_targets = [(int(g["weaker_midi"]), float(g["t_on"])) for g in ghosts if "weaker_midi" in g and "t_on" in g]
+    removed_count = 0
+    new_mid = mido.MidiFile(type=mid.type, ticks_per_beat=tpb)
+
+    for tr in mid.tracks:
+        new_tr = mido.MidiTrack()
+        abs_tick = 0
+        carry_dt = 0
+        suppressed_offs: dict[tuple[int, int], int] = {}
+        for msg in tr:
+            abs_tick += msg.time
+            dt = msg.time + carry_dt
+            drop = False
+            if msg.type == "note_on" and msg.velocity > 0:
+                t_sec = tick_to_sec(abs_tick)
+                match_idx = None
+                best_err = tol_sec + 1.0
+                for idx, (g_midi, g_t) in enumerate(remaining_targets):
+                    if g_midi == msg.note:
+                        err = abs(t_sec - g_t)
+                        if err <= tol_sec and err < best_err:
+                            best_err = err
+                            match_idx = idx
+                if match_idx is not None:
+                    remaining_targets.pop(match_idx)
+                    key = (msg.channel, msg.note)
+                    suppressed_offs[key] = suppressed_offs.get(key, 0) + 1
+                    removed_count += 1
+                    drop = True
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                key = (msg.channel, msg.note)
+                if suppressed_offs.get(key, 0) > 0:
+                    suppressed_offs[key] -= 1
+                    drop = True
+
+            if drop:
+                carry_dt = dt
+            else:
+                new_tr.append(msg.copy(time=dt))
+                carry_dt = 0
+        new_mid.tracks.append(new_tr)
+
+    out_midi.parent.mkdir(parents=True, exist_ok=True)
+    new_mid.save(str(out_midi))
+    return removed_count
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -117,13 +211,16 @@ def main() -> None:
     ap.add_argument("--xml", required=True)
     ap.add_argument("--bpm", type=float, required=True)
     ap.add_argument("--beats-per-bar", type=int, required=True)
+    ap.add_argument("--beat-type", type=int, default=None, choices=(4, 8), help="Optional denominator override (defaults to XML beat-type)")
     ap.add_argument("--first-downbeat", type=float, required=True)
+    ap.add_argument("--midi", default=None, help="Optional input MIDI path (required when using --clean-midi)")
+    ap.add_argument("--clean-midi", default=None, help="Optional output path to write MIDI with confirmed ghost notes removed")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     data, sr = sf.read(args.audio, dtype="float64", always_2d=True)
     mono = data.mean(axis=1)
-    notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat)
+    notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, beat_type=args.beat_type)
 
     pcs = np.bincount([n["midi"] % 12 for n in notes], minlength=12)
     scale_pcs = set(np.argsort(pcs)[-7:].tolist())
@@ -149,8 +246,10 @@ def main() -> None:
                     item = {
                         "measure": weaker["measure"],
                         "beat": weaker["beat"],
+                        "t_on": round(float(weaker["t_on"]), 4),
                         "clash_pair": [a["name"], b["name"]],
                         "weaker_note": weaker["name"],
+                        "weaker_midi": int(weaker["midi"]),
                         "f0_gap_db": round(gap_db, 2),
                         "weaker_og_db": weaker["og_db"],
                         "verdict": "CONFIRMED_GHOST" if is_ghost else "REAL_DISSONANCE",
@@ -163,12 +262,24 @@ def main() -> None:
     weak_oos = [n for n in oos_notes if n["snr_db"] < 12.0 or n["og_db"] < 3.0]
     low_og_lh = [n for n in notes if n["staff"] == 2 and n["og_db"] < 3.0]
 
+    removed_ghosts = 0
+    cleaned_midi_str = None
+    if args.clean_midi:
+        if not args.midi:
+            raise ValueError("--clean-midi requires --midi <input.mid>")
+        removed_ghosts = clean_ghost_notes_from_midi(Path(args.midi), Path(args.clean_midi), confirmed_ghosts)
+        cleaned_midi_str = str(Path(args.clean_midi))
+    remaining_ghosts = max(0, len(confirmed_ghosts) - removed_ghosts)
+
     report = {
         "stage": "stage_2_transcription_pitch_audit",
         "total_onsets": len(notes),
         "detected_scale_pcs": sorted(PC_NAMES[c] for c in scale_pcs),
         "minor2nd_clashes": clashes,
-        "confirmed_ghost_count": len(confirmed_ghosts),
+        "confirmed_ghost_count_detected": len(confirmed_ghosts),
+        "removed_ghost_notes_count": removed_ghosts,
+        "confirmed_ghost_count": remaining_ghosts,
+        "cleaned_midi": cleaned_midi_str,
         "out_of_scale_count": len(oos_notes),
         "out_of_scale_checked_pct": 100.0,
         "weak_out_of_scale_count": len(weak_oos),
