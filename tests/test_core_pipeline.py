@@ -704,3 +704,64 @@ def test_rubato_low_circular_r_preserves_beat_this_bpm() -> None:
     res = s1.calibrate_bpm_and_mode(times, flux, dur_s=120.0, bt_info=bt_info, bpm_override=None, mode_arg="auto")
     assert abs(res["bpm"] - 60.743) < 1e-2
     assert res["tempo_mode"] == "tempo-map"
+
+
+def test_stage3_prunes_orphan_tie_stop_without_phantom_note() -> None:
+    """Regression: truncated cross-bar note must NOT become a phantom re-struck note in the next bar."""
+    s3 = _load_script("stage3_engrave_study_score.py")
+    # Bar 0 (pickup_start=1, bar_slots=16 @ div=4): F5(77) held from slot 3 across barline into Bar 1 (dur=15),
+    # while G4(67) and Bb4(70) enter underneath -> Bar 0 must split into 2 voices preserving the real cross-bar tie!
+    notes_bar0 = [
+        s3.RawNote(start_slot=3, dur=15, pitch=77, hand=1),
+        s3.RawNote(start_slot=10, dur=1, pitch=67, hand=1),
+        s3.RawNote(start_slot=11, dur=1, pitch=70, hand=1),
+        s3.RawNote(start_slot=14, dur=2, pitch=75, hand=1),
+    ]
+    bars_map, max_bar = s3.slice_into_bars(notes_bar0, pickup_start=1, bar_slots=16)
+    slot_rms = np.full(64, -60.0)
+    bar_voices = {}
+    for b in range(0, max_bar + 1):
+        bar_len = 15 if b == 0 else 16
+        g_start = 1 if b == 0 else (b * 16)
+        bar_voices[(b, 1)] = s3.simplify_bar_hand(bars_map.get((b, 1), []), b, g_start, bar_len, slot_rms, 4)
+        bar_voices[(b, 2)] = ([], None)
+    s3.reconcile_cross_bar_ties(bar_voices, start_bar=0, max_bar=max_bar, bar_slots=16, pickup_start=1)
+
+    # Bar 1 must have zero phantom (non-tie_stop) attacks of F5(77)
+    b1_v1, b1_v2 = bar_voices[(1, 1)]
+    b1_f5_attacks = [
+        seg for ev in (b1_v1 + (b1_v2 or [])) for seg in ev.segs
+        if seg.pitch == 77 and not seg.tie_stop
+    ]
+    assert b1_f5_attacks == []
+
+
+def test_real_midi_pedal_reader_and_bar0_fallback(tmp_path: Path) -> None:
+    """Regression: read_midi_pedal_events extracts real CC64 from TransKun MIDI, and fallback covers Bar 0."""
+    pv = _load_script("pedal_and_velocity.py")
+    tm = _load_script("tempo_map.py")
+
+    mid = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    mid.tracks.append(tr)
+    tr.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    tr.append(mido.Message("control_change", control=64, value=127, time=240))
+    tr.append(mido.Message("control_change", control=64, value=0, time=480))
+    tr.append(mido.MetaMessage("end_of_track", time=0))
+    p_mid = tmp_path / "raw_pedal.mid"
+    mid.save(str(p_mid))
+
+    evs = pv.read_midi_pedal_events(p_mid, rate=48000)
+    assert len(evs) == 2
+    assert evs[0]["value"] == 127 and evs[0]["sample"] == 12000
+    assert evs[1]["value"] == 0 and evs[1]["sample"] == 36000
+
+    # Fallback dynamic pedaling must also cover Bar 0 pickup when notes have measure == 0
+    tmap = tm.TempoMap(bpm=60.0, beats_per_bar=4, beat_type=4, first_downbeat=4.0, mode="fixed-tempo")
+    notes_bar0 = [
+        {"measure": 0, "st": 0.5, "pitch": 60},
+        {"measure": 0, "st": 1.0, "pitch": 64},
+        {"measure": 1, "st": 4.0, "pitch": 65},
+    ]
+    fb = pv.compute_dynamic_pedal_events(notes_bar0, tmap, max_bar=1, rate=48000, pedal_style="legato_harmonic")
+    assert any(ev["sample"] < int(3.5 * 48000) and ev["value"] > 0 for ev in fb)

@@ -75,8 +75,10 @@ def compute_dynamic_pedal_events(
     prev_chroma = np.zeros(12, dtype=np.float64)
     pedal_is_down = False
 
-    for m in range(1, max_bar + 1):
-        tb, te = tempo_map.bar_bounds_sec(m)
+    start_bar = 0 if any(int(n.get("measure", 1)) == 0 for n in notes) else 1
+    for m in range(start_bar, max_bar + 1):
+        tb_raw, te = tempo_map.bar_bounds_sec(m)
+        tb = max(0.0, tb_raw) if m == 0 else tb_raw
         bar_dur = max(0.05, te - tb)
         step_dur = bar_dur / float(n_sub)
 
@@ -113,6 +115,38 @@ def compute_dynamic_pedal_events(
 
     controllers.append({"sample": max(0, int(round((t_end + 0.10) * rate))), "channel": 1, "controller": 64, "value": 0})
     return controllers
+
+
+def read_midi_pedal_events(midi_path: Path, rate: int = 48000) -> list[dict]:
+    """Read real CC64 sustain pedal events from a performance MIDI (e.g. TransKun score_raw.mid).
+
+    Returns an empty list if the source MIDI contains no active sustain pedal presses (value >= 32).
+    """
+    import mido
+
+    mid = mido.MidiFile(str(midi_path))
+    tpb = max(1, int(mid.ticks_per_beat))
+    cur_t = 0.0
+    cur_tempo = 500000
+    events: list[dict] = []
+    has_press = False
+    for msg in mido.merge_tracks(mid.tracks):
+        cur_t += mido.tick2second(msg.time, tpb, cur_tempo)
+        if msg.type == "set_tempo":
+            cur_tempo = msg.tempo
+        elif msg.type == "control_change" and msg.control == 64:
+            val = int(msg.value)
+            if val >= 32:
+                has_press = True
+            events.append(
+                {
+                    "sample": max(0, int(round(cur_t * rate))),
+                    "channel": 1,
+                    "controller": 64,
+                    "value": val,
+                }
+            )
+    return events if has_press else []
 
 
 def read_midi_velocity_events(midi_path: Path) -> list[tuple[float, int, int]]:

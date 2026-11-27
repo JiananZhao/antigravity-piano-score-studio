@@ -353,14 +353,6 @@ def simplify_bar_hand(
         by_s.setdefault(s.slot, []).append(s)
     slots = sorted(by_s)
 
-    if bar == 0:
-        v1 = []
-        for i, sl in enumerate(slots):
-            grp = sorted(by_s[sl], key=lambda x: x.pitch)
-            nxt = slots[i + 1] if i + 1 < len(slots) else bar_len
-            v1.append(ChordEvent(sl, max(1, min(min(x.dur for x in grp), nxt - sl)), grp))
-        return v1, None
-
     anchor_min_dur = int(round(anchor_min_dur_beats * divisions))
     anchor_segs: list[BarSegment] = []
     anchor_is_lower = True
@@ -422,15 +414,33 @@ def reconcile_cross_bar_ties(
             v1, v2 = bar_voices.get((b, staff), ([], None))
             all_evs = list(v1) + (list(v2) if v2 else [])
 
-            # 1. Clear any tie_stop on slot 0 not backed by an actual outgoing tie_start from bar b-1
+            # 1. Prune any orphan tie_stop segment not backed by an actual outgoing tie_start from bar b-1
+            #    (Never strip tie_stop=False, which would fabricate a phantom re-struck note!)
             matched_incoming: set[int] = set()
-            for ev in all_evs:
-                for seg in ev.segs:
-                    if seg.tie_stop:
-                        if ev.slot == 0 and seg.pitch in prev_outgoing:
-                            matched_incoming.add(seg.pitch)
+
+            def _prune_orphan_stops(ev_list: list[ChordEvent]) -> list[ChordEvent]:
+                cleaned: list[ChordEvent] = []
+                for ev in ev_list:
+                    kept_segs: list[BarSegment] = []
+                    for seg in ev.segs:
+                        if seg.tie_stop:
+                            if ev.slot == 0 and seg.pitch in prev_outgoing:
+                                matched_incoming.add(seg.pitch)
+                                kept_segs.append(seg)
+                            # else: drop orphan continuation tail rather than turning it into a new attack
                         else:
-                            seg.tie_stop = False
+                            kept_segs.append(seg)
+                    if kept_segs:
+                        ev.segs = kept_segs
+                        cleaned.append(ev)
+                return cleaned
+
+            v1 = _prune_orphan_stops(list(v1))
+            v2 = _prune_orphan_stops(list(v2)) if v2 else None
+            if v2 is not None and not v2:
+                v2 = None
+            bar_voices[(b, staff)] = (v1, v2)
+            all_evs = list(v1) + (list(v2) if v2 else [])
 
             # 2. If bar b-1 emitted a tie_start whose pitch vanished in bar b, clear it retroactively
             unmatched_prev = prev_outgoing - matched_incoming

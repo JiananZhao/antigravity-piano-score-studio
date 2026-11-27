@@ -1,6 +1,6 @@
 """Stage 4.2-4.4: Generalized two-band LH/RH velocity calibration, CC64 pedaling,
 Salamander Grand Piano rendering (sfizz_render CLI or music-learning NativeHost),
-and closed-loop two-band acoustic mastering.
+and transparent loudness-aligned mastering.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from style_analyzer import load_style_profile
 from pedal_and_velocity import (
     compute_dynamic_pedal_events,
     fuse_transkun_velocities,
+    read_midi_pedal_events,
     read_midi_velocity_events,
 )
 
@@ -336,7 +337,7 @@ def main() -> None:
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--song-name", default="PianoPiece")
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
-    ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities for touch fusion")
+    ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities and CC64 pedaling")
     ap.add_argument("--config", default=None)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
@@ -346,8 +347,6 @@ def main() -> None:
 
     orig_d, sr_orig = sf.read(args.orig_audio, dtype="float64", always_2d=True)
     mono_orig = orig_d.mean(axis=1)
-    orig_side = 0.5 * (orig_d[:, 0] - orig_d[:, 1]) if orig_d.shape[1] >= 2 else np.zeros_like(mono_orig)
-    target_sm = max(0.20, min(0.75, float(np.sqrt(np.mean(orig_side ** 2)) / (np.sqrt(np.mean(mono_orig ** 2)) + 1e-12))))
     target_rms_db = max(-26.0, min(-14.0, 20.0 * np.log10(float(np.sqrt(np.mean(mono_orig ** 2))) + 1e-12)))
 
     fft_full = np.fft.rfft(mono_orig)
@@ -433,7 +432,7 @@ def main() -> None:
     print(f"Stage 4 Round 1 Static Check: RH_med={rh_med:.1f}, LH_med={lh_med:.1f}, LH_max={lh_max}")
 
     rate = 48000
-    for m in range(1, max_bar + 1):
+    for m in range(0, max_bar + 1):
         _, b_end = tmap.bar_bounds_sec(m)
         m_lh = sorted([n for n in lh_all if n["measure"] == m], key=lambda x: x["st"])
         for i, n in enumerate(m_lh):
@@ -455,15 +454,24 @@ def main() -> None:
             render_notes.append({"sample": max(0, int(round(st * rate))), "duration_samples": int(round(dur * rate)), "note": n["pitch"], "velocity": round(n.get("calc_vel", 64) / 127.0, 4), "channel": 1, "staff": n["staff"]})
 
     _, t_end = tmap.bar_bounds_sec(max_bar)
-    controllers = compute_dynamic_pedal_events(
-        notes,
-        tempo_map=tmap,
-        max_bar=max_bar,
-        rate=rate,
-        pedal_style=pedal_style,
-        beats_per_bar=args.beats_per_bar,
-        beat_type=beat_type,
-    )
+    real_pedals: list[dict] = []
+    if pedal_style != "dry_articulated" and args.transkun_midi and Path(args.transkun_midi).is_file():
+        real_pedals = read_midi_pedal_events(Path(args.transkun_midi), rate=rate)
+    if len(real_pedals) >= 2:
+        controllers = real_pedals + [
+            {"sample": max(0, int(round((t_end + 0.15) * rate))), "channel": 1, "controller": 64, "value": 0}
+        ]
+        print(f"Stage 4 Pedaling: using {len(real_pedals)} real CC64 events from {Path(args.transkun_midi).name}")
+    else:
+        controllers = compute_dynamic_pedal_events(
+            notes,
+            tempo_map=tmap,
+            max_bar=max_bar,
+            rate=rate,
+            pedal_style=pedal_style,
+            beats_per_bar=args.beats_per_bar,
+            beat_type=beat_type,
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -475,53 +483,21 @@ def main() -> None:
         render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav, rate, int(round(t_end * rate)) + rate * 4)
         sig, sr = sf.read(str(raw_wav))
 
-    mid, side = 0.5 * (sig[:, 0] + sig[:, 1]), 0.5 * (sig[:, 0] - sig[:, 1])
-    cur_sm = float(np.sqrt(np.mean(side ** 2)) / (np.sqrt(np.mean(mid ** 2)) + 1e-12))
-    wf = float(np.clip(target_sm / (cur_sm + 1e-6), 0.35, 1.35))
-    sig_ms = np.column_stack([mid + side * wf, mid - side * wf])
-
-    n_smp = len(sig_ms)
-    freqs = np.fft.rfftfreq(n_smp, 1.0 / sr)
-    eq = np.ones_like(freqs)
-    sm = freqs < 130.0
-    eq[sm] = 0.32 + 0.68 * (np.clip((freqs[sm] - 30.0) / 100.0, 0.0, 1.0) ** 1.4)
-    eq += 0.45 * np.exp(-((freqs - 265.0) / 145.0) ** 2)
-    hm = freqs > 1400.0
-    eq[hm] *= 0.25 + 0.75 / (1.0 + ((freqs[hm] - 1400.0) / 900.0) ** 2)
-
-    lh_sp = np.clip((360.0 - freqs) / 40.0, 0.0, 1.0)
-    rh_sp = 1.0 - lh_sp
-    sig_lh = np.column_stack([np.fft.irfft(np.fft.rfft(sig_ms[:, c]) * eq * lh_sp, n=n_smp) for c in range(2)])
-    sig_rh = np.column_stack([np.fft.irfft(np.fft.rfft(sig_ms[:, c]) * eq * rh_sp, n=n_smp) for c in range(2)])
-
-    m_lh_r, m_rh_r = sig_lh.mean(axis=1), sig_rh.mean(axis=1)
-    dao, dar = min(len(mono_orig), int(t_end * sr_orig)), min(n_smp, int(t_end * sr))
-    sig_lh *= np.sqrt(np.mean(lh_band[:dao] ** 2)) / (np.sqrt(np.mean(m_lh_r[:dar] ** 2)) + 1e-12)
-    sig_rh *= np.sqrt(np.mean(rh_band[:dao] ** 2)) / (np.sqrt(np.mean(m_rh_r[:dar] ** 2)) + 1e-12)
-    m_lh_r, m_rh_r = sig_lh.mean(axis=1), sig_rh.mean(axis=1)
-
-    t_anc = np.arange(0.0, t_end + 0.5, 0.030)
-    gla, gra = [], []
-    for tc in t_anc:
-        ro = float(np.sqrt(np.mean(lh_band[max(0, int((tc - 0.275) * sr_orig)) : min(len(mono_orig), int((tc + 0.275) * sr_orig))] ** 2) + 1e-10))
-        rr = float(np.sqrt(np.mean(m_lh_r[max(0, int((tc - 0.275) * sr)) : min(n_smp, int((tc + 0.275) * sr))] ** 2) + 1e-10))
-        gla.append(float(np.clip((ro / rr) ** 0.72, 0.45, 1.85)) if (tc <= t_end and rr > 1e-4) else 1.0)
-        ro2 = float(np.sqrt(np.mean(rh_band[max(0, int((tc - 0.275) * sr_orig)) : min(len(mono_orig), int((tc + 0.275) * sr_orig))] ** 2) + 1e-10))
-        rr2 = float(np.sqrt(np.mean(m_rh_r[max(0, int((tc - 0.275) * sr)) : min(n_smp, int((tc + 0.275) * sr))] ** 2) + 1e-10))
-        gra.append(float(np.clip((ro2 / rr2) ** 0.65, 0.55, 1.80)) if (tc <= t_end and rr2 > 1e-4) else 1.0)
-
-    k = np.exp(-0.5 * (np.arange(-12, 13) / 5.0) ** 2); k /= np.sum(k)
-    tg = np.arange(n_smp) / sr
-    el = np.interp(tg, t_anc, np.convolve(np.pad(gla, 12, mode="edge"), k, mode="valid"))
-    er = np.interp(tg, t_anc, np.convolve(np.pad(gra, 12, mode="edge"), k, mode="valid"))
-    final_sig = sig_lh * el[:, None] + sig_rh * er[:, None]
-
+    # Preserve natural Salamander Grand Piano timbre & dynamics:
+    # Apply only transparent whole-song RMS loudness alignment + -1.0 dBFS peak ceiling
+    # (no hard-coded EQ colorization and no 30ms envelope pumping).
+    final_sig = np.asarray(sig, dtype=np.float64)
+    if final_sig.ndim == 1:
+        final_sig = np.column_stack([final_sig, final_sig])
+    n_smp = len(final_sig)
+    dar = min(n_smp, max(1, int(t_end * sr)))
     rms_cur = float(np.sqrt(np.mean(final_sig[:dar] ** 2)))
-    final_sig *= (10.0 ** (target_rms_db / 20.0)) / (rms_cur + 1e-12)
-    ceil = 10.0 ** (-3.5 / 20.0)
-    final_sig = ceil * np.tanh(final_sig / ceil)
-    if np.max(np.abs(final_sig)) > ceil:
-        final_sig *= ceil / np.max(np.abs(final_sig))
+    if rms_cur > 1e-9:
+        final_sig *= (10.0 ** (target_rms_db / 20.0)) / rms_cur
+    ceil = 10.0 ** (-1.0 / 20.0)
+    peak = float(np.max(np.abs(final_sig))) if n_smp else 0.0
+    if peak > ceil:
+        final_sig *= ceil / peak
 
     full_wav = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.wav"
     prev_wav = out_dir / f"{args.song_name}_Bars0_20_Preview_Salamander.wav"
