@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -37,12 +38,14 @@ def load_config(plugin_root: Path, cfg_arg: str | None) -> dict:
     return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
 
 
-def parse_notes_from_xml(xml_path: Path, bpm: float, beats_per_bar: int, first_downbeat: float) -> tuple[list[dict], int]:
+def parse_notes_from_xml(xml_path: Path, bpm: float, beats_per_bar: int, first_downbeat: float) -> tuple[list[dict], int, int]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
     divisions = int(root.findtext(".//attributes/divisions", "2"))
-    eighth_s = 60.0 / (bpm * divisions)
-    bar_units = beats_per_bar * divisions
+    beat_type = int(root.findtext(".//attributes/time/beat-type", "4"))
+    quarter_s = (60.0 / bpm) * (beat_type / 4.0)
+    unit_s = quarter_s / float(divisions)
+    bar_units = (beats_per_bar * divisions * 4) // beat_type
 
     open_ties: dict[tuple[int, int], dict] = {}
     finished: list[dict] = []
@@ -78,7 +81,6 @@ def parse_notes_from_xml(xml_path: Path, bpm: float, beats_per_bar: int, first_d
                 raw_items.append((on, dur, midi, staff, ts, te, arp))
 
         bar_slot_0 = (bar_units - max_end) if (b == 0 and implicit) else (b * bar_units)
-        bar1_slot = bar_units if any(mm.attrib.get("number") == "0" for mm in root.findall(".//part/measure")) else bar_units
         for on, dur, midi, staff, ts, te, arp in raw_items:
             gs, ge = bar_slot_0 + on, bar_slot_0 + on + dur
             key = (staff, midi)
@@ -99,10 +101,10 @@ def parse_notes_from_xml(xml_path: Path, bpm: float, beats_per_bar: int, first_d
     for rem in open_ties.values():
         finished.append(rem)
     for n in finished:
-        n["st"] = first_downbeat + (n["start_slot"] - bar_units) * eighth_s
-        n["et"] = first_downbeat + (n["end_slot"] - bar_units) * eighth_s
+        n["st"] = first_downbeat + (n["start_slot"] - bar_units) * unit_s
+        n["et"] = first_downbeat + (n["end_slot"] - bar_units) * unit_s
     finished.sort(key=lambda x: (x["st"], x["staff"], x["pitch"]))
-    return finished, max_bar
+    return finished, max_bar, beat_type
 
 
 def rh_harm_db(mono: np.ndarray, sr: int, st: float, pitch: int) -> float:
@@ -146,17 +148,18 @@ def lh_expr_db(mono: np.ndarray, lh_band: np.ndarray, sr: int, st: float, pitch:
     return 0.65 * lh_rms + 0.35 * (10.0 * np.log10(max(1e-12, he)) + 26.0)
 
 
-def export_midi(render_notes: list[dict], controllers: list[dict], rate: int, bpm: float, beats_per_bar: int, key_fifths: int, out_mid: Path) -> None:
+def export_midi(render_notes: list[dict], controllers: list[dict], rate: int, bpm: float, beats_per_bar: int, beat_type: int, key_fifths: int, out_mid: Path) -> None:
     mid = mido.MidiFile(ticks_per_beat=480)
     meta = mido.MidiTrack()
     mid.tracks.append(meta)
     meta.name = "Calibrated Salamander Edition"
-    meta.append(mido.MetaMessage("time_signature", numerator=beats_per_bar, denominator=4, time=0))
+    meta.append(mido.MetaMessage("time_signature", numerator=beats_per_bar, denominator=beat_type, time=0))
     meta.append(mido.MetaMessage("key_signature", key=FIFTHS_TO_KEY.get(key_fifths, "C"), time=0))
-    meta.append(mido.MetaMessage("set_tempo", tempo=int(round(60_000_000 / bpm)), time=0))
+    quarter_bpm = bpm * (4.0 / beat_type)
+    meta.append(mido.MetaMessage("set_tempo", tempo=int(round(60_000_000 / quarter_bpm)), time=0))
     meta.append(mido.MetaMessage("end_of_track", time=0))
 
-    ticks_per_sec = 480.0 * (bpm / 60.0)
+    ticks_per_sec = 480.0 * (quarter_bpm / 60.0)
     for name, staff_num, inc_cc in (("Piano Right Hand", 1, False), ("Piano Left Hand & Pedal", 2, True)):
         tr = mido.MidiTrack()
         tr.name = name
@@ -193,11 +196,13 @@ def render_with_sfizz_or_native(
 ) -> None:
     backend = cfg.get("renderer_backend", "auto")
     sfz_rel = cfg.get("salamander_sfz", "assets_local/salamander/Salamander Grand Piano V3.sfz")
+    ml_root_str = cfg.get("music_learning_root") or os.environ.get("MUSIC_LEARNING_ROOT", "")
     sfz_candidates = [
         Path(sfz_rel) if Path(sfz_rel).is_absolute() else (plugin_root / sfz_rel),
         plugin_root / "assets_local" / "salamander" / "Salamander Grand Piano V3.sfz",
-        Path(r"E:\AI\Playground\music-learning\data\instruments\render_tmp\resources\Salamander Grand Piano V3.sfz"),
     ]
+    if ml_root_str:
+        sfz_candidates.append(Path(ml_root_str) / "data" / "instruments" / "render_tmp" / "resources" / "Salamander Grand Piano V3.sfz")
     sfz_path = next((p for p in sfz_candidates if p.is_file()), None)
     if not sfz_path:
         sal_dir = plugin_root / "assets_local" / "salamander"
@@ -221,8 +226,8 @@ def render_with_sfizz_or_native(
         if proc.returncode == 0 and raw_wav.is_file():
             return
 
-    ml_root = Path(cfg.get("music_learning_root") or r"E:\AI\Playground\music-learning")
-    if backend in ("auto", "native_host") and (ml_root / "scripts" / "native_host.py").is_file():
+    ml_root = Path(ml_root_str) if ml_root_str else None
+    if backend in ("auto", "native_host") and ml_root and (ml_root / "scripts" / "native_host.py").is_file():
         sys.path.insert(0, str(ml_root))
         sys.path.insert(0, str(ml_root / "src"))
         sys.path.insert(0, str(ml_root / "scripts"))
@@ -285,7 +290,9 @@ def main() -> None:
     lh_band = np.fft.irfft(np.where((freqs_o >= 45.0) & (freqs_o <= 350.0), fft_full, 0.0), n=len(mono_orig))
     rh_band = np.fft.irfft(np.where((freqs_o >= 350.0) & (freqs_o <= 3500.0), fft_full, 0.0), n=len(mono_orig))
 
-    notes, max_bar = parse_notes_from_xml(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat)
+    notes, max_bar, beat_type = parse_notes_from_xml(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat)
+    if not notes:
+        raise ValueError(f"No playable notes found in MusicXML: {args.xml}")
     bar_s = args.beats_per_bar * (60.0 / args.bpm)
 
     bar_lh_db, bar_rh_db = {}, {}
@@ -298,21 +305,25 @@ def main() -> None:
 
     rh_all = [n for n in notes if n["staff"] == 1]
     lh_all = [n for n in notes if n["staff"] == 2]
-    for n in rh_all:
-        n["raw_db"] = rh_harm_db(mono_orig, sr_orig, n["st"], n["pitch"])
-    rh_dbs = [n["raw_db"] for n in rh_all]
-    p10, p90 = np.percentile(rh_dbs, 10), np.percentile(rh_dbs, 90)
-    rh_raw = [48.0 + np.clip((n["raw_db"] - p10) / (p90 - p10 + 1e-5), 0.0, 1.0) * 44.0 for n in rh_all]
-    rh_sm = 0.60 * np.convolve(rh_raw, np.ones(3) / 3.0, mode="same") + 0.40 * np.array(rh_raw)
-    for n, v in zip(rh_all, rh_sm):
-        n["calc_vel"] = int(np.clip(round(v), 42, 92))
-    rh_slots: dict[int, list[dict]] = {}
-    for n in rh_all:
-        rh_slots.setdefault(n["start_slot"], []).append(n)
-    for g in rh_slots.values():
-        if len(g) >= 2:
-            top = max(g, key=lambda x: x["pitch"])
-            top["calc_vel"] = min(94, top["calc_vel"] + 4)
+    if rh_all:
+        for n in rh_all:
+            n["raw_db"] = rh_harm_db(mono_orig, sr_orig, n["st"], n["pitch"])
+        rh_dbs = [n["raw_db"] for n in rh_all]
+        p10, p90 = np.percentile(rh_dbs, 10), np.percentile(rh_dbs, 90)
+        rh_raw = [48.0 + np.clip((n["raw_db"] - p10) / (p90 - p10 + 1e-5), 0.0, 1.0) * 44.0 for n in rh_all]
+        if len(rh_raw) >= 3:
+            rh_sm = 0.60 * np.convolve(rh_raw, np.ones(3) / 3.0, mode="same") + 0.40 * np.array(rh_raw)
+        else:
+            rh_sm = np.array(rh_raw, dtype=np.float64)
+        for n, v in zip(rh_all, rh_sm):
+            n["calc_vel"] = int(np.clip(round(v), 42, 92))
+        rh_slots: dict[int, list[dict]] = {}
+        for n in rh_all:
+            rh_slots.setdefault(n["start_slot"], []).append(n)
+        for g in rh_slots.values():
+            if len(g) >= 2:
+                top = max(g, key=lambda x: x["pitch"])
+                top["calc_vel"] = min(94, top["calc_vel"] + 4)
 
     bar_rh_mean, last_v = {}, 68.0
     for m in range(0, max_bar + 1):
@@ -321,26 +332,27 @@ def main() -> None:
             last_v = float(np.mean(vals))
         bar_rh_mean[m] = last_v
 
-    for n in lh_all:
-        nd = lh_expr_db(mono_orig, lh_band, sr_orig, n["st"], n["pitch"])
-        n["raw_db"] = 0.50 * nd + 0.50 * bar_lh_db.get(n["measure"], nd)
-    lh_p5, lh_p95 = np.percentile([n["raw_db"] for n in lh_all], 5), np.percentile([n["raw_db"] for n in lh_all], 95)
-    for n in lh_all:
-        m = n["measure"]
-        norm = float(np.clip((n["raw_db"] - lh_p5) / (lh_p95 - lh_p5 + 1e-5), 0.0, 1.0))
-        vel = 30.0 + (norm ** 1.15) * 42.0
-        if n["pitch"] <= 40:
-            vel -= 8.0
-        elif n["pitch"] <= 46:
-            vel -= 5.0
-        if (bar_lh_db[m] - bar_rh_db[m]) < -4.0:
-            vel = min(vel, bar_rh_mean[m] - 14.0)
-        n["calc_vel"] = int(np.clip(round(vel), 26, 74))
+    if lh_all:
+        for n in lh_all:
+            nd = lh_expr_db(mono_orig, lh_band, sr_orig, n["st"], n["pitch"])
+            n["raw_db"] = 0.50 * nd + 0.50 * bar_lh_db.get(n["measure"], nd)
+        lh_p5, lh_p95 = np.percentile([n["raw_db"] for n in lh_all], 5), np.percentile([n["raw_db"] for n in lh_all], 95)
+        for n in lh_all:
+            m = n["measure"]
+            norm = float(np.clip((n["raw_db"] - lh_p5) / (lh_p95 - lh_p5 + 1e-5), 0.0, 1.0))
+            vel = 30.0 + (norm ** 1.15) * 42.0
+            if n["pitch"] <= 40:
+                vel -= 8.0
+            elif n["pitch"] <= 46:
+                vel -= 5.0
+            if (bar_lh_db[m] - bar_rh_db[m]) < -4.0:
+                vel = min(vel, bar_rh_mean[m] - 14.0)
+            n["calc_vel"] = int(np.clip(round(vel), 26, 74))
 
     # Round 1 static dynamics check
-    rh_med = float(np.median([n["calc_vel"] for n in rh_all]))
-    lh_med = float(np.median([n["calc_vel"] for n in lh_all]))
-    lh_max = int(max(n["calc_vel"] for n in lh_all))
+    rh_med = float(np.median([n["calc_vel"] for n in rh_all])) if rh_all else 0.0
+    lh_med = float(np.median([n["calc_vel"] for n in lh_all])) if lh_all else 0.0
+    lh_max = int(max(n["calc_vel"] for n in lh_all)) if lh_all else 0
     print(f"Stage 4 Round 1 Static Check: RH_med={rh_med:.1f}, LH_med={lh_med:.1f}, LH_max={lh_max}")
 
     rate = 48000
@@ -363,7 +375,7 @@ def main() -> None:
         for idx, n in enumerate(cl):
             st = n["st"] + (idx * step if len(cl) > 1 else 0.0)
             dur = max(0.14, n["et"] - st) * (0.98 if n["staff"] == 1 else 1.0)
-            render_notes.append({"sample": max(0, int(round(st * rate))), "duration_samples": int(round(dur * rate)), "note": n["pitch"], "velocity": round(n["calc_vel"] / 127.0, 4), "channel": 1, "staff": n["staff"]})
+            render_notes.append({"sample": max(0, int(round(st * rate))), "duration_samples": int(round(dur * rate)), "note": n["pitch"], "velocity": round(n.get("calc_vel", 64) / 127.0, 4), "channel": 1, "staff": n["staff"]})
 
     controllers = []
     for m in range(1, max_bar + 1):
@@ -376,7 +388,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mid_out = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.mid"
-    export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, args.key_fifths, mid_out)
+    export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out)
 
     with tempfile.TemporaryDirectory() as tmpd:
         raw_wav = Path(tmpd) / "raw.wav"
