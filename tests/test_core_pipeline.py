@@ -6,6 +6,7 @@ Runs without GPU, PyTorch, MuScriptor, beat_this, MuseScore, or sfizz.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -17,6 +18,8 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "piano-score-stud
 
 
 def _load_script(name: str):
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
     path = SCRIPTS_DIR / name
     spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec is not None and spec.loader is not None
@@ -146,3 +149,80 @@ def test_stage0_audio_triage_wav_and_m4a_rejection(tmp_path: Path) -> None:
     res = s0.analyze_audio(wav)
     assert res["clipping_count"] == 0
     assert res["sample_rate"] == sr
+
+
+def test_rubato_tempo_map_stage2_and_stage4_midi_roundtrip(tmp_path: Path) -> None:
+    tm = _load_script("tempo_map.py")
+    s2 = _load_script("stage2_pitch_audit.py")
+    s4 = _load_script("stage4_render_calibrated.py")
+
+    # Ritardando: Bar 1 @ 120 BPM (0.5 s/q -> [0.5..2.5]), Bar 2 @ 80 BPM (0.75 s/q -> [2.5..5.5])
+    q_beats = [0.5, 1.0, 1.5, 2.0, 2.5, 3.25, 4.0, 4.75, 5.5]
+    cal_path = tmp_path / "stage1_calibration.json"
+    cal_path.write_text(
+        json.dumps(
+            {
+                "calibration": {"tempo_mode": "tempo-map"},
+                "tempo_map": {
+                    "mode": "tempo-map",
+                    "first_downbeat": 0.5,
+                    "quarter_bpm": 100.0,
+                    "beats_per_bar": 4,
+                    "beat_type": 4,
+                    "quarter_beats": q_beats,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tmap = tm.load_tempo_map(cal_path, bpm=100.0, beats_per_bar=4, beat_type=4, first_downbeat=0.5)
+    assert tmap.is_rubato
+    assert abs(tmap.bar_bounds_sec(1)[1] - 2.5) < 1e-6
+    assert abs(tmap.bar_bounds_sec(2)[1] - 5.5) < 1e-6
+
+    # Verify Stage 2 MusicXML onset timing follows rubato curve
+    xml_text = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>2</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>4</duration><staff>1</staff></note>
+      <note><pitch><step>D</step><octave>5</octave></pitch><duration>4</duration><staff>1</staff></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>4</duration><staff>1</staff></note>
+      <note><pitch><step>F</step><octave>5</octave></pitch><duration>4</duration><staff>1</staff></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+    xml_path = tmp_path / "rubato.musicxml"
+    xml_path.write_text(xml_text, encoding="utf-8")
+    notes = s2.parse_xml_onsets(xml_path, bpm=100.0, beats_per_bar=4, first_downbeat=0.5, tempo_map=tmap)
+    expected_onsets = [0.5, 1.5, 2.5, 4.0]
+    for n, exp in zip(notes, expected_onsets):
+        assert abs(n["t_on"] - exp) < 1e-4
+
+    # Verify Stage 4 export_midi writes a real rubato tempo map matching wall-clock note times within 3 ms
+    rate = 48000
+    render_notes = [
+        {"sample": int(round(t * rate)), "duration_samples": int(round(0.4 * rate)), "note": 60 + i, "velocity": 0.6, "channel": 1, "staff": 1}
+        for i, t in enumerate(expected_onsets)
+    ]
+    out_mid = tmp_path / "rubato_out.mid"
+    s4.export_midi(render_notes, [], rate, bpm=100.0, beats_per_bar=4, beat_type=4, key_fifths=0, out_mid=out_mid, tempo_map=tmap)
+
+    mid_back = mido.MidiFile(str(out_mid))
+    # Reconstruct real-time playback timestamps from merged tracks
+    cur_t = 0.0
+    cur_tempo = 500000
+    observed_onsets = []
+    for msg in mido.merge_tracks(mid_back.tracks):
+        cur_t += mido.tick2second(msg.time, mid_back.ticks_per_beat, cur_tempo)
+        if msg.type == "set_tempo":
+            cur_tempo = msg.tempo
+        elif msg.type == "note_on" and msg.velocity > 0:
+            observed_onsets.append(cur_t)
+    assert len(observed_onsets) == len(expected_onsets)
+    for obs, exp in zip(observed_onsets, expected_onsets):
+        assert abs(obs - exp) < 0.003

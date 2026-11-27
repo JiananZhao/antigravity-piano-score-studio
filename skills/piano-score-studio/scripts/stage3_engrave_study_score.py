@@ -29,6 +29,10 @@ import mido
 import numpy as np
 import soundfile as sf
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tempo_map import TempoMap, load_tempo_map
+
 DIVISIONS = 2  # Default divisions per quarter note (2 = eighth-note grid)
 
 SHARP_PC_SPELLING = {
@@ -156,6 +160,7 @@ def load_slot_rms_db(
     first_downbeat: float,
     bar1_slot: int,
     total_slots: int,
+    tempo_map: TempoMap | None = None,
 ) -> np.ndarray:
     data, sr = sf.read(str(audio_path), dtype="float64", always_2d=True)
     mono = data.mean(axis=1)
@@ -163,8 +168,12 @@ def load_slot_rms_db(
     slot_s = quarter_s / float(divisions)
     dbs = np.full(total_slots, -60.0, dtype=np.float64)
     for s in range(total_slots):
-        t0 = first_downbeat + (s - bar1_slot) * slot_s
-        t1 = t0 + slot_s
+        if tempo_map is not None and tempo_map.is_rubato:
+            t0 = tempo_map.slot_to_sec(s - bar1_slot, divisions)
+            t1 = tempo_map.slot_to_sec(s + 1 - bar1_slot, divisions)
+        else:
+            t0 = first_downbeat + (s - bar1_slot) * slot_s
+            t1 = t0 + slot_s
         i0, i1 = max(0, int(round(t0 * sr))), min(len(mono), int(round(t1 * sr)))
         if i1 > i0:
             dbs[s] = 20.0 * np.log10(float(np.sqrt(np.mean(mono[i0:i1] ** 2))) + 1e-12)
@@ -564,6 +573,7 @@ def main() -> None:
     ap.add_argument("--beat-type", type=int, default=4, choices=(4, 8), help="Time signature denominator (4 or 8)")
     ap.add_argument("--grid", type=int, default=DIVISIONS, choices=(2, 3, 4), help="Subdivisions per quarter note (2=8th, 3=triplet-8th, 4=16th)")
     ap.add_argument("--first-downbeat", type=float, required=True)
+    ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--dynamics-csv", default=None)
     ap.add_argument("--musescore", default=None)
@@ -577,7 +587,8 @@ def main() -> None:
         raise ValueError(f"No playable notes found in MIDI: {args.midi}")
     bar1_slot = bar_slots if pickup_start > 0 else 0
     total_slots = max(n.start_slot + n.dur for n in notes) + bar_slots
-    slot_rms = load_slot_rms_db(Path(args.audio), args.bpm, args.beat_type, divisions, args.first_downbeat, bar1_slot, total_slots)
+    tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, args.beat_type, args.first_downbeat)
+    slot_rms = load_slot_rms_db(Path(args.audio), args.bpm, args.beat_type, divisions, args.first_downbeat, bar1_slot, total_slots, tempo_map=tmap)
     split_hands(notes)
     bars_map, max_bar = slice_into_bars(notes, pickup_start, bar_slots)
 

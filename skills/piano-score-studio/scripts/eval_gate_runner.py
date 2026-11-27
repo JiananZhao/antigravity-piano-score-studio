@@ -13,6 +13,10 @@ import mido
 import numpy as np
 import soundfile as sf
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tempo_map import load_tempo_map
+
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 
 
@@ -264,12 +268,11 @@ def main() -> None:
     pct_c_150 = 100.0 * float(np.sum(sp_c[(fs_c >= 20) & (fs_c < 150)] ** 2) / (np.sum(sp_c ** 2) + 1e-12))
     band_150_diff = abs(pct_c_150 - pct_o_150)
 
-    bar_s = args.beats_per_bar * (60.0 / args.bpm)
+    tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, beat_type, args.first_downbeat)
     num_full_bars = len(measures) - (1 if int(measures[0].attrib["number"]) == 0 else 0)
     lh_errs, rh_errs = [], []
     for b in range(1, num_full_bars + 1):
-        t0 = args.first_downbeat + (b - 1) * bar_s
-        t1 = t0 + bar_s
+        t0, t1 = tmap.bar_bounds_sec(b)
         lh_errs.append(band_db(m_c, sr_c, t0, t1, 45, 350) - band_db(m_o, sr_o, t0, t1, 45, 350))
         rh_errs.append(band_db(m_c, sr_c, t0, t1, 350, 3500) - band_db(m_o, sr_o, t0, t1, 350, 3500))
     med_lh_err = float(np.median(lh_errs))
@@ -277,9 +280,10 @@ def main() -> None:
 
     # Real Stage 1 tempo & downbeat checks (replacing hardcoded PASS)
     r_val, max_drift_ms = measure_tempo_lock(m_o, sr_o, args.bpm, args.first_downbeat)
+    rubato_ok = bool(args.rubato_verified) or tmap.is_rubato
     if r_val >= 0.70 and max_drift_ms <= 30.0:
         s1_tempo_status = "PASS"
-    elif args.rubato_verified or (r_val >= 0.50 and max_drift_ms <= 60.0):
+    elif rubato_ok or (r_val >= 0.50 and max_drift_ms <= 60.0):
         s1_tempo_status = "WARN"
     else:
         s1_tempo_status = "FAIL"
@@ -309,7 +313,7 @@ def main() -> None:
         "s0_audio_integrity": (s0_integrity, {"clips": cand["clipping_count"], "jumps": cand["click_jumps_gt_0.1"], "dropouts": cand["dropouts_lt_-70dB"]}),
         "s0_mono_coherence": (s0_mono, {"mono_cancel_gt6dB_pct": cancel_pct, "selected": rec_name}),
         "s0_leading_note": (s0_lead, {"first_note_sec": cand["first_note_sec"], "pad2s_verified": pad2s_verified}),
-        "s1_tempo_lock": (s1_tempo_status, {"bpm": args.bpm, "circular_R": r_val, "max_drift_ms": max_drift_ms}),
+        "s1_tempo_lock": (s1_tempo_status, {"bpm": args.bpm, "tempo_mode": tmap.mode, "circular_R": r_val, "max_drift_ms": max_drift_ms}),
         "s1_downbeat_meter": (s1_downbeat_status, {"beats_per_bar": args.beats_per_bar, "beat_type": beat_type, "beat_onsets": beat_onsets, "pickup_aligned": pickup_aligned}),
         "s1_grid_cleanliness": ("PASS" if spurious_pct < 2.0 else ("WARN" if spurious_pct <= 8.0 else "FAIL"), {"spurious_16_32_pct": round(spurious_pct, 2)}),
         "s2_clash_ghost_audit": ("PASS" if pitch_audit["confirmed_ghost_count"] == 0 else "FAIL", {"confirmed_ghosts": pitch_audit["confirmed_ghost_count"]}),

@@ -20,6 +20,10 @@ import mido
 import numpy as np
 import soundfile as sf
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tempo_map import TempoMap, load_tempo_map
+
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 FIFTHS_TO_KEY = {
     -7: "Cb", -6: "Gb", -5: "Db", -4: "Ab", -3: "Eb", -2: "Bb", -1: "F",
@@ -38,7 +42,13 @@ def load_config(plugin_root: Path, cfg_arg: str | None) -> dict:
     return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
 
 
-def parse_notes_from_xml(xml_path: Path, bpm: float, beats_per_bar: int, first_downbeat: float) -> tuple[list[dict], int, int]:
+def parse_notes_from_xml(
+    xml_path: Path,
+    bpm: float,
+    beats_per_bar: int,
+    first_downbeat: float,
+    tempo_map: TempoMap | None = None,
+) -> tuple[list[dict], int, int]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
     divisions = int(root.findtext(".//attributes/divisions", "2"))
@@ -101,8 +111,12 @@ def parse_notes_from_xml(xml_path: Path, bpm: float, beats_per_bar: int, first_d
     for rem in open_ties.values():
         finished.append(rem)
     for n in finished:
-        n["st"] = first_downbeat + (n["start_slot"] - bar_units) * unit_s
-        n["et"] = first_downbeat + (n["end_slot"] - bar_units) * unit_s
+        if tempo_map is not None and tempo_map.is_rubato:
+            n["st"] = tempo_map.slot_to_sec(n["start_slot"] - bar_units, divisions)
+            n["et"] = tempo_map.slot_to_sec(n["end_slot"] - bar_units, divisions)
+        else:
+            n["st"] = first_downbeat + (n["start_slot"] - bar_units) * unit_s
+            n["et"] = first_downbeat + (n["end_slot"] - bar_units) * unit_s
     finished.sort(key=lambda x: (x["st"], x["staff"], x["pitch"]))
     return finished, max_bar, beat_type
 
@@ -148,18 +162,37 @@ def lh_expr_db(mono: np.ndarray, lh_band: np.ndarray, sr: int, st: float, pitch:
     return 0.65 * lh_rms + 0.35 * (10.0 * np.log10(max(1e-12, he)) + 26.0)
 
 
-def export_midi(render_notes: list[dict], controllers: list[dict], rate: int, bpm: float, beats_per_bar: int, beat_type: int, key_fifths: int, out_mid: Path) -> None:
-    mid = mido.MidiFile(ticks_per_beat=480)
+def export_midi(
+    render_notes: list[dict],
+    controllers: list[dict],
+    rate: int,
+    bpm: float,
+    beats_per_bar: int,
+    beat_type: int,
+    key_fifths: int,
+    out_mid: Path,
+    tempo_map: TempoMap | None = None,
+) -> None:
+    tpb = 480
+    mid = mido.MidiFile(ticks_per_beat=tpb)
     meta = mido.MidiTrack()
     mid.tracks.append(meta)
     meta.name = "Calibrated Salamander Edition"
     meta.append(mido.MetaMessage("time_signature", numerator=beats_per_bar, denominator=beat_type, time=0))
     meta.append(mido.MetaMessage("key_signature", key=FIFTHS_TO_KEY.get(key_fifths, "C"), time=0))
     quarter_bpm = bpm * (4.0 / beat_type)
-    meta.append(mido.MetaMessage("set_tempo", tempo=int(round(60_000_000 / quarter_bpm)), time=0))
+    use_rubato = tempo_map is not None and tempo_map.is_rubato
+    tempo_segs = tempo_map.midi_tempo_segments(tpb) if use_rubato and tempo_map is not None else None
+    if use_rubato and tempo_segs:
+        prev_tk = 0
+        for tk, _, us in tempo_segs:
+            meta.append(mido.MetaMessage("set_tempo", tempo=us, time=max(0, tk - prev_tk)))
+            prev_tk = tk
+    else:
+        meta.append(mido.MetaMessage("set_tempo", tempo=int(round(60_000_000 / quarter_bpm)), time=0))
     meta.append(mido.MetaMessage("end_of_track", time=0))
 
-    ticks_per_sec = 480.0 * (quarter_bpm / 60.0)
+    ticks_per_sec = float(tpb) * (quarter_bpm / 60.0)
     for name, staff_num, inc_cc in (("Piano Right Hand", 1, False), ("Piano Left Hand & Pedal", 2, True)):
         tr = mido.MidiTrack()
         tr.name = name
@@ -175,10 +208,16 @@ def export_midi(render_notes: list[dict], controllers: list[dict], rate: int, bp
             for c in controllers:
                 evs.append((c["sample"], "cc", c["controller"], c["value"]))
         evs.sort(key=lambda x: (x[0], 0 if x[1] == "cc" else (1 if x[1] == "off" else 2), x[2]))
-        cur_s = 0
+        cur_tk = 0
         for smp, kind, p1, p2 in evs:
-            dt = max(0, int(round(((smp - cur_s) / rate) * ticks_per_sec)))
-            cur_s = smp
+            t_sec = smp / float(rate)
+            abs_tk = (
+                tempo_map.sec_to_tick(t_sec, tpb, segments=tempo_segs)
+                if (use_rubato and tempo_map is not None)
+                else max(0, int(round(t_sec * ticks_per_sec)))
+            )
+            dt = max(0, abs_tk - cur_tk)
+            cur_tk = abs_tk
             if kind == "on":
                 tr.append(mido.Message("note_on", channel=0, note=p1, velocity=p2, time=dt))
             elif kind == "off":
@@ -270,6 +309,7 @@ def main() -> None:
     ap.add_argument("--bpm", type=float, required=True)
     ap.add_argument("--beats-per-bar", type=int, required=True)
     ap.add_argument("--first-downbeat", type=float, required=True)
+    ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--song-name", default="PianoPiece")
     ap.add_argument("--config", default=None)
@@ -290,15 +330,16 @@ def main() -> None:
     lh_band = np.fft.irfft(np.where((freqs_o >= 45.0) & (freqs_o <= 350.0), fft_full, 0.0), n=len(mono_orig))
     rh_band = np.fft.irfft(np.where((freqs_o >= 350.0) & (freqs_o <= 3500.0), fft_full, 0.0), n=len(mono_orig))
 
-    notes, max_bar, beat_type = parse_notes_from_xml(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat)
+    xml_beat_type = int(ET.parse(args.xml).getroot().findtext(".//attributes/time/beat-type", "4"))
+    tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, xml_beat_type, args.first_downbeat)
+    notes, max_bar, beat_type = parse_notes_from_xml(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, tempo_map=tmap)
     if not notes:
         raise ValueError(f"No playable notes found in MusicXML: {args.xml}")
-    bar_s = args.beats_per_bar * (60.0 / args.bpm)
 
     bar_lh_db, bar_rh_db = {}, {}
     for m in range(0, max_bar + 1):
-        t0 = max(0.0, args.first_downbeat + (m - 1) * bar_s)
-        t1 = t0 + bar_s
+        t0_raw, t1 = tmap.bar_bounds_sec(m)
+        t0 = max(0.0, t0_raw)
         i0, i1 = int(t0 * sr_orig), min(len(mono_orig), int(t1 * sr_orig))
         bar_lh_db[m] = 20.0 * np.log10(float(np.sqrt(np.mean(lh_band[i0:i1] ** 2))) + 1e-12) if i1 > i0 else -55.0
         bar_rh_db[m] = 20.0 * np.log10(float(np.sqrt(np.mean(rh_band[i0:i1] ** 2))) + 1e-12) if i1 > i0 else -55.0
@@ -357,7 +398,7 @@ def main() -> None:
 
     rate = 48000
     for m in range(1, max_bar + 1):
-        b_end = args.first_downbeat + m * bar_s
+        _, b_end = tmap.bar_bounds_sec(m)
         m_lh = sorted([n for n in lh_all if n["measure"] == m], key=lambda x: x["st"])
         for i, n in enumerate(m_lh):
             nxt = [o["st"] for o in m_lh[i + 1 :] if o["pitch"] == n["pitch"]]
@@ -379,16 +420,16 @@ def main() -> None:
 
     controllers = []
     for m in range(1, max_bar + 1):
-        tb = args.first_downbeat + (m - 1) * bar_s
+        tb, _ = tmap.bar_bounds_sec(m)
         controllers.append({"sample": max(0, int(round((tb - 0.018) * rate))), "channel": 1, "controller": 64, "value": 0})
         controllers.append({"sample": int(round((tb + 0.028) * rate)), "channel": 1, "controller": 64, "value": 127})
-    t_end = args.first_downbeat + max_bar * bar_s
+    _, t_end = tmap.bar_bounds_sec(max_bar)
     controllers.append({"sample": int(round((t_end + 0.10) * rate)), "channel": 1, "controller": 64, "value": 0})
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mid_out = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.mid"
-    export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out)
+    export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out, tempo_map=tmap)
 
     with tempfile.TemporaryDirectory() as tmpd:
         raw_wav = Path(tmpd) / "raw.wav"
@@ -447,7 +488,8 @@ def main() -> None:
     prev_wav = out_dir / f"{args.song_name}_Bars0_20_Preview_Salamander.wav"
     sf.write(str(full_wav), final_sig, sr, subtype="PCM_24")
 
-    b20_end = int((args.first_downbeat + min(20, max_bar) * bar_s + 2.5) * sr)
+    _, b20_t_end = tmap.bar_bounds_sec(min(20, max_bar))
+    b20_end = int((b20_t_end + 2.5) * sr)
     pv = final_sig[: min(len(final_sig), b20_end)].copy()
     fl = min(len(pv), int(1.5 * sr))
     pv[-fl:] *= np.linspace(1.0, 0.0, fl)[:, None]
