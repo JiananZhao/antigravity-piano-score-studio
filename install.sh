@@ -7,6 +7,8 @@ cd "$ROOT"
 INSTALL_TOOLS=0
 DOWNLOAD_SALAMANDER=0
 DOWNLOAD_MUSCRIPTOR=0
+CPU_ONLY=0
+CUDA_INDEX="cu124"
 
 for arg in "$@"; do
   case "$arg" in
@@ -24,13 +26,19 @@ for arg in "$@"; do
     --download-muscriptor)
       DOWNLOAD_MUSCRIPTOR=1
       ;;
+    --cpu-only)
+      CPU_ONLY=1
+      ;;
+    --cuda-index=*)
+      CUDA_INDEX="${arg#*=}"
+      ;;
     -h|--help)
-      echo "Usage: ./install.sh [--install-all] [--install-tools] [--download-salamander] [--download-muscriptor]"
+      echo "Usage: ./install.sh [--install-all] [--install-tools] [--download-salamander] [--download-muscriptor] [--cpu-only] [--cuda-index=cu124]"
       exit 0
       ;;
     *)
       echo "Unknown option: $arg" >&2
-      echo "Usage: ./install.sh [--install-all] [--install-tools] [--download-salamander] [--download-muscriptor]" >&2
+      echo "Usage: ./install.sh [--install-all] [--install-tools] [--download-salamander] [--download-muscriptor] [--cpu-only] [--cuda-index=cu124]" >&2
       exit 2
       ;;
   esac
@@ -44,6 +52,39 @@ fi
 
 VENV_PY="$ROOT/.venv/bin/python"
 "$VENV_PY" -m pip install --upgrade pip
+
+# Auto-detect GPU and prefer CUDA PyTorch on Linux (macOS uses MPS natively)
+HOST_OS="$(uname -s)"
+if [ "$CPU_ONLY" -eq 0 ]; then
+  if [ "$HOST_OS" = "Linux" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n 1 || true)"
+    if [ -n "$GPU_NAME" ]; then
+      echo "NVIDIA GPU detected: $GPU_NAME"
+      HAS_CUDA="$("$VENV_PY" -c "import torch; print(int(torch.cuda.is_available()))" 2>/dev/null || echo 0)"
+      if [ "$HAS_CUDA" != "1" ]; then
+        CUDA_OK=0
+        for idx in "$CUDA_INDEX" "cu121"; do
+          echo "Installing CUDA PyTorch ($idx) for GPU acceleration..."
+          if "$VENV_PY" -m pip install --upgrade "torch>=2.2" --index-url "https://download.pytorch.org/whl/$idx"; then
+            CUDA_OK=1
+            break
+          fi
+          echo "Warning: CUDA PyTorch install failed for $idx; trying fallback..."
+        done
+        if [ "$CUDA_OK" -eq 0 ]; then
+          echo "Warning: Could not install CUDA PyTorch automatically; falling back to default PyPI torch."
+        fi
+      else
+        echo "CUDA-enabled PyTorch is already installed in .venv."
+      fi
+    fi
+  elif [ "$HOST_OS" = "Darwin" ]; then
+    echo "macOS detected: standard PyTorch wheel supports Apple Silicon MPS GPU acceleration automatically."
+  fi
+else
+  echo "--cpu-only specified; skipping CUDA PyTorch auto-detection."
+fi
+
 "$VENV_PY" -m pip install -r requirements.txt
 
 if [ ! -f "config.json" ]; then

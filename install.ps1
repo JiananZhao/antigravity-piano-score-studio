@@ -3,6 +3,8 @@ param(
     [switch]$InstallTools,
     [switch]$DownloadSalamander,
     [switch]$DownloadMuScriptor,
+    [switch]$CpuOnly,
+    [string]$CudaIndex = "cu124",
     [string]$PythonExe = "python"
 )
 
@@ -25,6 +27,41 @@ if (-not (Test-Path ".venv")) {
 $VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
 & $VenvPy -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade pip." }
+
+# Auto-detect NVIDIA GPU and install CUDA-enabled PyTorch before requirements.txt
+if (-not $CpuOnly) {
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($nvidiaSmi) {
+        $gpuName = (& $nvidiaSmi.Source --query-gpu=name --format=csv,noheader 2>$null | Select-Object -First 1)
+        if ($LASTEXITCODE -eq 0 -and $gpuName) {
+            Write-Host "NVIDIA GPU detected: $gpuName"
+            $hasCudaTorch = (& $VenvPy -c "import torch; print(int(torch.cuda.is_available()))" 2>$null)
+            if ($LASTEXITCODE -ne 0 -or $hasCudaTorch.Trim() -ne "1") {
+                $cudaInstalled = $false
+                $indices = @($CudaIndex, "cu121") | Select-Object -Unique
+                foreach ($idx in $indices) {
+                    Write-Host "Installing CUDA PyTorch ($idx) for GPU acceleration..."
+                    & $VenvPy -m pip install --upgrade "torch>=2.2" --index-url "https://download.pytorch.org/whl/$idx"
+                    if ($LASTEXITCODE -eq 0) {
+                        $cudaInstalled = $true
+                        break
+                    }
+                    Write-Warning "CUDA PyTorch install failed for $idx; trying fallback..."
+                }
+                if (-not $cudaInstalled) {
+                    Write-Warning "Could not install CUDA PyTorch automatically; falling back to default PyPI torch (CPU)."
+                }
+            } else {
+                Write-Host "CUDA-enabled PyTorch is already installed in .venv."
+            }
+        }
+    } else {
+        Write-Host "No NVIDIA GPU detected (nvidia-smi not found); installing standard PyTorch."
+    }
+} else {
+    Write-Host "-CpuOnly specified; skipping CUDA PyTorch auto-detection."
+}
+
 & $VenvPy -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) { throw "Failed to install Python dependencies from requirements.txt." }
 
