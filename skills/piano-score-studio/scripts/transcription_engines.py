@@ -129,6 +129,30 @@ def quantize_performance_midi(
     if not quantized:
         raise ValueError("No notes available to quantize.")
 
+    # Deduplicate same (start_slot, pitch) keeping strongest velocity/longest duration,
+    # and trim overlapping same-pitch tails to prevent hanging MIDI notes.
+    dedup_map: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    for s_on, dur, pitch, vel in quantized:
+        key = (s_on, pitch)
+        prev = dedup_map.get(key)
+        if prev is None:
+            dedup_map[key] = (s_on, dur, pitch, vel)
+        else:
+            dedup_map[key] = (s_on, max(prev[1], dur), pitch, max(prev[3], vel))
+    by_pitch: dict[int, list[tuple[int, int, int, int]]] = {}
+    for item in dedup_map.values():
+        by_pitch.setdefault(item[2], []).append(item)
+    cleaned_q: list[tuple[int, int, int, int]] = []
+    for pitch_notes in by_pitch.values():
+        pitch_notes.sort(key=lambda x: x[0])
+        for idx, (s_on, dur, pitch, vel) in enumerate(pitch_notes):
+            if idx + 1 < len(pitch_notes):
+                nxt_on = pitch_notes[idx + 1][0]
+                dur = max(1, min(dur, nxt_on - s_on))
+            cleaned_q.append((s_on, dur, pitch, vel))
+    cleaned_q.sort(key=lambda x: (x[0], x[2]))
+    quantized = cleaned_q
+
     min_slot = min(x[0] for x in quantized)
     # Shift so Bar 1 starts at bar_slots if there is a Bar 0 pickup, else at 0
     if trim_leading_bars:

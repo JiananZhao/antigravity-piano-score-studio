@@ -138,6 +138,8 @@ def clean_ghost_notes_from_midi(
     out_midi: Path,
     ghosts: list[dict],
     tol_sec: float = 0.08,
+    tempo_map: TempoMap | None = None,
+    has_pickup: bool = False,
 ) -> int:
     """Remove confirmed ghost notes (matched by pitch + onset time) from a MIDI file."""
     import mido
@@ -184,7 +186,11 @@ def clean_ghost_notes_from_midi(
             dt = msg.time + carry_dt
             drop = False
             if msg.type == "note_on" and msg.velocity > 0:
-                t_sec = tick_to_sec(abs_tick)
+                if tempo_map is not None:
+                    q_rel = (abs_tick / float(tpb)) - (tempo_map.bar_quarters if has_pickup else 0.0)
+                    t_sec = tempo_map.q_to_sec(q_rel)
+                else:
+                    t_sec = tick_to_sec(abs_tick)
                 match_idx = None
                 best_err = tol_sec + 1.0
                 for idx, (g_midi, g_t) in enumerate(remaining_targets):
@@ -297,7 +303,19 @@ def main() -> None:
     if args.clean_midi:
         if not args.midi:
             raise ValueError("--clean-midi requires --midi <input.mid>")
-        removed_ghosts = clean_ghost_notes_from_midi(Path(args.midi), Path(args.clean_midi), confirmed_ghosts)
+        has_pickup = False
+        if args.stage1_cal and Path(args.stage1_cal).is_file():
+            cal_obj = json.loads(Path(args.stage1_cal).read_text(encoding="utf-8"))
+            hp_val = (cal_obj.get("calibration") or {}).get("has_pickup")
+            if hp_val is not None:
+                has_pickup = bool(hp_val)
+            else:
+                has_pickup = any(m.attrib.get("number") == "0" and m.attrib.get("implicit") == "yes" for m in xml_root.findall(".//part/measure"))
+        else:
+            has_pickup = any(m.attrib.get("number") == "0" and m.attrib.get("implicit") == "yes" for m in xml_root.findall(".//part/measure"))
+        removed_ghosts = clean_ghost_notes_from_midi(
+            Path(args.midi), Path(args.clean_midi), confirmed_ghosts, tempo_map=tmap, has_pickup=has_pickup
+        )
         cleaned_midi_str = str(Path(args.clean_midi))
     remaining_ghosts = max(0, len(confirmed_ghosts) - removed_ghosts)
 
