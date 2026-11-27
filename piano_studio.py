@@ -427,7 +427,7 @@ def main() -> None:
             "--style-profile",
             str(style_profile_arg),
             "--transkun-midi",
-            str(baseline_mid),
+            str(Path(manifest["artifacts"].get("score_raw_mid") or baseline_mid)),
             "--out-dir",
             str(deliverables_dir),
         ]
@@ -463,7 +463,7 @@ def main() -> None:
             ],
         )
         manifest["artifacts"]["ab_dir"] = str(ab_dir)
-        if pitch_audit_json.is_file() and study_pdf.is_file():
+        if pitch_audit_json.is_file() and (study_pdf.is_file() or args.skip_pdf):
             eval_cmd = [
                 py,
                 str(SCRIPTS_DIR / "eval_gate_runner.py"),
@@ -479,8 +479,7 @@ def main() -> None:
                 str(dynamics_csv),
                 "--xml",
                 str(study_xml),
-                "--pdf",
-                str(study_pdf),
+                *(["--pdf", str(study_pdf)] if study_pdf.is_file() else ["--skip-pdf"]),
                 "--midi",
                 str(cal_mid),
                 "--orig-audio",

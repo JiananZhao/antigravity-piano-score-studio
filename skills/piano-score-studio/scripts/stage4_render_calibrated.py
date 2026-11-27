@@ -266,7 +266,16 @@ def render_with_sfizz_or_native(
                     sfizz_exe = str(hit)
                     break
     if backend in ("auto", "sfizz_render") and sfizz_exe:
-        cmd = [str(sfizz_exe), "--sfz", str(sfz_path), "--midi", str(mid_path), "--wav", str(raw_wav), "--samplerate", str(rate)]
+        cmd = [
+            str(sfizz_exe),
+            "--sfz", str(sfz_path),
+            "--midi", str(mid_path),
+            "--wav", str(raw_wav),
+            "--samplerate", str(rate),
+            "--quality", "1",
+            "--polyphony", "64",
+            "--use-eot",
+        ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         except subprocess.TimeoutExpired as exc:
