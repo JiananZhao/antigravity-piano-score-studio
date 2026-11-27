@@ -1,0 +1,19 @@
+# Local runtime, models, samples & credentials (NEVER commit to GitHub)
+.venv/
+__pycache__/
+*.pyc
+config.json
+secrets/
+hf_token
+assets_local/
+models/
+cache/
+output/
+tmp/
+*.wav
+*.mp3
+*.flac
+*.mid
+*.pdf
+*.safetensors
+*.ckpt

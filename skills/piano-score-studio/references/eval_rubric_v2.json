@@ -1,0 +1,192 @@
+{
+  "schema_version": "2.0",
+  "workflow_name": "PianoTranscription_StudyScore_and_SalamanderAudio_v2",
+  "sop_document": "skills/piano-score-studio/references/workflow_v2.md",
+  "stages": [
+    {
+      "stage_id": "stage_0_audio_triage",
+      "name": "输入音频体检与选源",
+      "tool": "scripts/stage0_audio_triage.py",
+      "checks": [
+        {
+          "id": "s0_audio_integrity",
+          "metric": "clipping_count, click_jumps_gt_0.1, dropouts_lt_-70dB",
+          "pass_rule": "clipping_count == 0 and click_jumps == 0 and dropouts == 0",
+          "warn_rule": "clipping_count <= 3 and dropouts == 0",
+          "fail_rule": "clipping_count > 3 or click_jumps > 0 or dropouts > 0",
+          "blocking": true,
+          "remediation": "更换干净母带或先修复坏帧/爆音再继续"
+        },
+        {
+          "id": "s0_mono_coherence",
+          "metric": "strong_harmonic_mono_cancel_gt_6dB_pct",
+          "pass_rule": "pct < 12.0 and best_candidate_selected",
+          "warn_rule": "12.0 <= pct <= 25.0",
+          "fail_rule": "pct > 25.0 or inferior_candidate_selected",
+          "blocking": false,
+          "remediation": "在多候选文件中切换相位一致性更高的版本"
+        },
+        {
+          "id": "s0_leading_note",
+          "metric": "first_note_time_sec_and_2s_pad_check",
+          "pass_rule": "first_note_sec >= 0.15 or pad2s_verified",
+          "warn_rule": "first_note_sec < 0.15 and pad2s_pending",
+          "fail_rule": "first_note_missing",
+          "blocking": true,
+          "remediation": "对前置 2s 静音后的音频转录并回填首音与正确弱起"
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_1_tempo_meter_grid",
+      "name": "速度、拍号、首重拍与量化网格校准",
+      "checks": [
+        {
+          "id": "s1_tempo_lock",
+          "metric": "circular_resultant_R, segment_phase_drift_ms",
+          "pass_rule": "R >= 0.70 and max_abs_drift_ms <= 30 with --fixed-tempo",
+          "warn_rule": "0.50 <= R < 0.70 or rubato_tempo_map_verified",
+          "fail_rule": "R < 0.40 or uncalibrated_tempo_drift",
+          "blocking": true,
+          "remediation": "重新扫描圆统计 BPM 或改用分段 --tempo-map 对齐表"
+        },
+        {
+          "id": "s1_downbeat_meter",
+          "metric": "beat1_bass_and_onset_dominance, anacrusis_alignment",
+          "pass_rule": "beat1_onsets > beat2_and_beat3 and pickup_aligned",
+          "warn_rule": "compound_meter_alternation_within_3_4_or_6_8",
+          "fail_rule": "systematic_half_beat_or_full_beat_barline_shift",
+          "blocking": true,
+          "remediation": "依据低音起音通量与和声变化周期重新锁定 --first-downbeat 与 --beats-per-bar"
+        },
+        {
+          "id": "s1_grid_cleanliness",
+          "metric": "spurious_16th_32nd_note_ratio_pct",
+          "pass_rule": "ratio_pct < 2.0",
+          "warn_rule": "2.0 <= ratio_pct <= 8.0",
+          "fail_rule": "ratio_pct > 10.0 without fast passage evidence",
+          "blocking": true,
+          "remediation": "依据起音亚拍直方图调整 --grid（2/3/4）重新量化"
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_2_transcription_pitch_audit",
+      "name": "原始转录与音高/撞音深度审计",
+      "tool": "scripts/stage2_pitch_audit.py",
+      "checks": [
+        {
+          "id": "s2_clash_ghost_audit",
+          "metric": "confirmed_minor2nd_ghosts, suspicious_low_og_notes",
+          "pass_rule": "confirmed_ghosts == 0",
+          "warn_rule": "confirmed_ghosts == 0 and low_og_candidates > 0",
+          "fail_rule": "confirmed_ghosts > 0",
+          "blocking": true,
+          "remediation": "剔除低于同拍主和声 >12 dB 且 OG < 3 dB 的虚假幽灵重触发并记入修改日志"
+        },
+        {
+          "id": "s2_out_of_scale_verify",
+          "metric": "out_of_scale_harmonic_snr_checked_pct",
+          "pass_rule": "checked_pct == 100.0 and weak_oos_count == 0",
+          "warn_rule": "checked_pct == 100.0 and weak_oos_count > 0",
+          "fail_rule": "checked_pct < 100.0",
+          "blocking": true,
+          "remediation": "对全部调外音做原音 SNR/OG 核验，保留真实经过音/借用和弦，仅删伪音"
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_3_pedagogical_engraving_review",
+      "name": "人类学习版曲谱排谱与两轮复查",
+      "tool": "scripts/stage3_engrave_study_score.py",
+      "checks": [
+        {
+          "id": "s3_r1_clefs_voices",
+          "metric": "mid_piece_clef_changes, max_voices_per_hand",
+          "pass_rule": "mid_piece_clef_changes == 0 and max_voices_per_hand <= 2",
+          "warn_rule": "barline_only_register_clef_changes <= 4 and max_voices_per_hand <= 2",
+          "fail_rule": "intra_bar_clef_flipping or max_voices_per_hand >= 3",
+          "blocking": true,
+          "remediation": "优化跨度与音区滞后分谱算法，锁定 RH=G2 / LH=F4，仅真长音复调启用第 2 声部"
+        },
+        {
+          "id": "s3_r1_rests_durations",
+          "metric": "voice_duration_errors, visible_rests",
+          "pass_rule": "voice_duration_errors == 0 and visible_rests <= 100",
+          "warn_rule": "voice_duration_errors == 0 and visible_rests <= 160",
+          "fail_rule": "voice_duration_errors > 0",
+          "blocking": true,
+          "remediation": "修复小节时值汇总并启用音频感知连奏桥接与隐藏次声部占位休止符"
+        },
+        {
+          "id": "s3_r1_playability_notation",
+          "metric": "unmarked_gt12_semitone_chords, unclosed_ties, spurious_16th_32nd",
+          "pass_rule": "all == 0",
+          "warn_rule": "unclosed_ties == 0 and unmarked_gt12 == 0 and spurious_16th_32nd <= 5",
+          "fail_rule": "unmarked_gt12 > 0 or unclosed_ties > 0",
+          "blocking": true,
+          "remediation": "增加 arpeggiate 标记、按拍规范符尾分组、按调号修正等音拼写"
+        },
+        {
+          "id": "s3_r2_pdf_visual",
+          "metric": "pdf_exists_nonempty, all_pages_visually_inspected, collisions",
+          "pass_rule": "pdf_exists and all_pages_inspected and collisions == 0",
+          "warn_rule": "pdf_exists and not_recorded_visual_check",
+          "fail_rule": "not pdf_exists or collisions > 0",
+          "blocking": true,
+          "remediation": "用 MuseScore 渲染后逐页打开 PDF 检查并修复文字/音符碰撞与分页"
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_4_dynamics_plan_and_2round_review",
+      "name": "力度分析计划、执行与两轮强制复查",
+      "tool": "scripts/stage4_dynamics_plan.py",
+      "checks": [
+        {
+          "id": "s4_plan_before_exec",
+          "metric": "dynamics_plan_md_exists, bar_lh_rh_envelope_csv_exists",
+          "pass_rule": "both_files_generated_before_midi_calibration_and_vst_render",
+          "warn_rule": "none",
+          "fail_rule": "missing_dynamics_plan_or_envelope_analysis",
+          "blocking": true,
+          "remediation": "先运行 stage4_dynamics_plan.py 输出 dynamics_plan.md 与 bar_lh_rh_envelope.csv"
+        },
+        {
+          "id": "s4_r1_static_dynamics",
+          "metric": "placeholder_vel100_only, rh_med_minus_lh_med, lh_max_vel, unclosed_wedges",
+          "pass_rule": "not_placeholder and (rh_med - lh_med) >= 15 and lh_max <= 78 and unclosed_wedges == 0",
+          "warn_rule": "not_placeholder and 10 <= (rh_med - lh_med) < 15 and lh_max <= 82 and unclosed_wedges == 0",
+          "fail_rule": "placeholder_vel100_only or (rh_med - lh_med) < 10 or lh_max > 88 or unclosed_wedges > 0",
+          "blocking": true,
+          "remediation": "下调左手映射上限、增大低音衰减与 LH-RH 差值约束，补全闭合楔形线"
+        },
+        {
+          "id": "s4_r2_acoustic_match",
+          "metric": "nan_inf_count, tail_snr_dB, median_lh_err_dB, median_rh_err_dB, band_20_150_pct_diff",
+          "pass_rule": "nan_inf == 0 and tail_snr_dB >= 80 and abs(median_lh_err_dB) <= 1.5 and abs(median_rh_err_dB) <= 1.5 and band_20_150_pct_diff <= 4.0",
+          "warn_rule": "nan_inf == 0 and tail_snr_dB >= 70 and abs(median_lh_err_dB) <= 2.5 and abs(median_rh_err_dB) <= 2.5",
+          "fail_rule": "nan_inf > 0 or tail_snr_dB < 70 or abs(median_lh_err_dB) > 2.5 or abs(median_rh_err_dB) > 2.5 or band_20_150_pct_diff > 6.0",
+          "blocking": true,
+          "remediation": "调整低音力度上限、EQ 低频滚降或双频段包络跟踪参数，重跑 Salamander 渲染并复验"
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_5_final_delivery",
+      "name": "高音质成品交付与听觉对照包",
+      "tool": "scripts/stage5_ab_excerpts.py",
+      "checks": [
+        {
+          "id": "s5_deliverables_complete",
+          "metric": "required_artifacts_present_and_nonempty, ab_excerpts_present",
+          "pass_rule": "pdf and xml and midi and cal_wav and ab_excerpts_present",
+          "warn_rule": "core_files_present_but_ab_excerpts_missing",
+          "fail_rule": "missing_core_file",
+          "blocking": true,
+          "remediation": "补齐缺失核心成品并运行 stage5_ab_excerpts.py"
+        }
+      ]
+    }
+  ]
+}

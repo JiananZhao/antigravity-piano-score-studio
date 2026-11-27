@@ -1,0 +1,10 @@
+{
+  "musescore_exe": "",
+  "renderer_backend": "auto",
+  "sfizz_render_exe": "",
+  "music_learning_root": "",
+  "salamander_sfz": "assets_local/salamander/Salamander Grand Piano V3.sfz",
+  "muscriptor_model_dir": "models/medium",
+  "hf_home": "cache/huggingface",
+  "torch_home": "cache/torch"
+}

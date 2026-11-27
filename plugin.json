@@ -1,0 +1,14 @@
+{
+  "name": "piano-score-studio",
+  "displayName": "Piano Score Studio",
+  "version": "2.0.0",
+  "description": "End-to-end solo piano audio to human-readable study sheet music (PDF/MusicXML) and calibrated Salamander Grand Piano audio/MIDI with multi-round score & two-band dynamics verification.",
+  "author": "JiananZhao",
+  "homepage": "https://github.com/JiananZhao/antigravity-piano-score-studio",
+  "repository": "https://github.com/JiananZhao/antigravity-piano-score-studio",
+  "suggestedPrompts": [
+    "Analyze my piano WAV files in input/, pick the best source, and calibrate tempo and meter",
+    "Transcribe and engrave a human-readable study score PDF with two-round visual verification",
+    "Create a two-band dynamics plan and render calibrated Salamander Grand Piano audio + A/B excerpts"
+  ]
+}
