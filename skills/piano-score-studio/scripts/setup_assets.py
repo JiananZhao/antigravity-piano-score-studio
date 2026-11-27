@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -13,9 +14,67 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-SALAMANDER_URL = "https://github.com/sfzinstruments/SalamanderGrandPianoV3/archive/refs/heads/master.tar.gz"
+SALAMANDER_URL = os.environ.get(
+    "SALAMANDER_ARCHIVE_URL",
+    "https://github.com/sfzinstruments/SalamanderGrandPianoV3/archive/refs/heads/master.tar.gz",
+)
 SFIZZ_LATEST_API = "https://api.github.com/repos/sfztools/sfizz/releases/latest"
 MUSCRIPTOR_REPO_ID = "MuScriptor/muscriptor-medium"
+
+
+def sha256_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a local file."""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_sha256(path: Path, expected_sha256: str | None, label: str = "archive") -> str:
+    """Return file SHA-256 and raise ValueError if expected_sha256 is provided and mismatches."""
+    actual = sha256_file(path)
+    print(f"SHA-256 ({label}): {actual}")
+    if expected_sha256:
+        exp = expected_sha256.strip().lower()
+        if actual.lower() != exp:
+            raise ValueError(f"SHA-256 mismatch for {label}: expected {exp}, got {actual}")
+    return actual
+
+
+def _ensure_within_dest(dest_resolved: Path, target: Path, member_name: str) -> None:
+    try:
+        target.resolve().relative_to(dest_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Blocked unsafe archive path traversal entry: {member_name!r}") from exc
+
+
+def safe_extract_tar(tf: tarfile.TarFile, dest_dir: Path) -> None:
+    """Extract tar archive safely, blocking path traversal and unsafe links (P2-1)."""
+    dest_resolved = dest_dir.resolve()
+    for member in tf.getmembers():
+        if member.name.startswith("/") or member.name.startswith("\\"):
+            raise ValueError(f"Blocked unsafe absolute tar entry: {member.name!r}")
+        target = dest_resolved / member.name
+        _ensure_within_dest(dest_resolved, target, member.name)
+        if member.issym() or member.islnk():
+            link_target = (target.parent / member.linkname).resolve()
+            _ensure_within_dest(dest_resolved, link_target, f"{member.name} -> {member.linkname}")
+    if sys.version_info >= (3, 12):
+        tf.extractall(dest_dir, filter="data")
+    else:
+        tf.extractall(dest_dir)
+
+
+def safe_extract_zip(zf: zipfile.ZipFile, dest_dir: Path) -> None:
+    """Extract zip archive safely, blocking ZipSlip path traversal entries (P2-1)."""
+    dest_resolved = dest_dir.resolve()
+    for info in zf.infolist():
+        if info.filename.startswith("/") or info.filename.startswith("\\"):
+            raise ValueError(f"Blocked unsafe absolute zip entry: {info.filename!r}")
+        target = dest_resolved / info.filename
+        _ensure_within_dest(dest_resolved, target, info.filename)
+    zf.extractall(dest_dir)
 
 
 def find_plugin_root() -> Path:
@@ -123,7 +182,12 @@ def find_muscriptor_model(plugin_root: Path, cfg: dict) -> tuple[Path, bool]:
     return model_dir, ready
 
 
-def download_salamander(dest_dir: Path, plugin_root: Path, cfg: dict) -> Path | None:
+def download_salamander(
+    dest_dir: Path,
+    plugin_root: Path,
+    cfg: dict,
+    expected_sha256: str | None = None,
+) -> Path | None:
     existing = find_salamander_sfz(plugin_root, cfg)
     if existing:
         print(f"Salamander Grand Piano V3 already available: {existing}")
@@ -132,9 +196,10 @@ def download_salamander(dest_dir: Path, plugin_root: Path, cfg: dict) -> Path | 
     archive = dest_dir / "salamander_v3.tar.gz"
     print(f"Downloading Salamander Grand Piano V3 (CC-BY 3.0, ~714 MB) from {SALAMANDER_URL} ...")
     urllib.request.urlretrieve(SALAMANDER_URL, str(archive))
-    print("Extracting archive...")
+    verify_sha256(archive, expected_sha256 or os.environ.get("SALAMANDER_SHA256"), label="Salamander V3")
+    print("Extracting archive safely...")
     with tarfile.open(archive, "r:gz") as tf:
-        tf.extractall(dest_dir)
+        safe_extract_tar(tf, dest_dir)
     archive.unlink(missing_ok=True)
     for sfz in sorted(dest_dir.rglob("*Salamander*.sfz")):
         if sfz.is_file():
@@ -161,7 +226,12 @@ def _select_sfizz_asset(assets: list[dict]) -> dict | None:
     return None
 
 
-def download_sfizz(dest_dir: Path, cfg: dict, plugin_root: Path) -> Path | None:
+def download_sfizz(
+    dest_dir: Path,
+    cfg: dict,
+    plugin_root: Path,
+    expected_sha256: str | None = None,
+) -> Path | None:
     existing = find_renderer(cfg, plugin_root).get("sfizz_render")
     if existing:
         print(f"sfizz_render already available: {existing}")
@@ -186,13 +256,14 @@ def download_sfizz(dest_dir: Path, cfg: dict, plugin_root: Path) -> Path | None:
         archive = dest_dir / pkg_name
         print(f"Downloading sfizz ({pkg_name}) from {url} ...")
         urllib.request.urlretrieve(url, str(archive))
-        print("Extracting sfizz archive...")
+        verify_sha256(archive, expected_sha256 or os.environ.get("SFIZZ_SHA256"), label=pkg_name)
+        print("Extracting sfizz archive safely...")
         if pkg_name.lower().endswith(".zip"):
             with zipfile.ZipFile(archive, "r") as zf:
-                zf.extractall(dest_dir)
+                safe_extract_zip(zf, dest_dir)
         else:
             with tarfile.open(archive, "r:*") as tf:
-                tf.extractall(dest_dir)
+                safe_extract_tar(tf, dest_dir)
         archive.unlink(missing_ok=True)
 
         hit = find_local_sfizz(plugin_root)
@@ -276,6 +347,8 @@ def main() -> None:
     ap.add_argument("--download-sfizz", action="store_true", help="Auto-download official sfizz_render binary into assets_local/sfizz/")
     ap.add_argument("--download-salamander", action="store_true", help="Auto-download Salamander Grand Piano V3 (CC-BY 3.0, ~714 MB)")
     ap.add_argument("--download-muscriptor", action="store_true", help="Download MuScriptor/muscriptor-medium (~1.17 GB) using your HF login/token")
+    ap.add_argument("--salamander-sha256", default=None, help="Optional expected SHA-256 hex digest for Salamander archive verification")
+    ap.add_argument("--sfizz-sha256", default=None, help="Optional expected SHA-256 hex digest for sfizz archive verification")
     ap.add_argument("--write-config", action="store_true", help="Persist detected paths into config.json")
     args = ap.parse_args()
 
@@ -283,9 +356,9 @@ def main() -> None:
     cfg = load_config(plugin_root, args.config)
 
     if args.download_sfizz:
-        download_sfizz(plugin_root / "assets_local" / "sfizz", cfg, plugin_root)
+        download_sfizz(plugin_root / "assets_local" / "sfizz", cfg, plugin_root, expected_sha256=args.sfizz_sha256)
     if args.download_salamander:
-        download_salamander(plugin_root / "assets_local" / "salamander", plugin_root, cfg)
+        download_salamander(plugin_root / "assets_local" / "salamander", plugin_root, cfg, expected_sha256=args.salamander_sha256)
     if args.download_muscriptor:
         download_muscriptor(resolve_muscriptor_dir(plugin_root, cfg))
 
@@ -299,7 +372,7 @@ def main() -> None:
         "muscriptor_model_dir": str(muscriptor_dir),
         "muscriptor_model_ready": muscriptor_ready,
     }
-    for pkg in ("numpy", "soundfile", "mido", "torch", "muscriptor", "beat_this"):
+    for pkg in ("numpy", "soundfile", "mido", "torch", "transkun", "muscriptor", "beat_this"):
         try:
             mod = __import__(pkg)
             status[f"pkg_{pkg}"] = True
