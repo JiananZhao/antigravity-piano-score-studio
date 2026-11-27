@@ -267,8 +267,16 @@ def render_with_sfizz_or_native(
                     break
     if backend in ("auto", "sfizz_render") and sfizz_exe:
         cmd = [str(sfizz_exe), "--sfz", str(sfz_path), "--midi", str(mid_path), "--wav", str(raw_wav), "--samplerate", str(rate)]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode == 0 and raw_wav.is_file():
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            if backend == "sfizz_render":
+                raise RuntimeError(
+                    f"sfizz_render timed out after {exc.timeout}s while rendering {mid_path.name}."
+                ) from exc
+            print(f"[WARN] sfizz_render timed out after {exc.timeout}s; checking fallback backend.")
+            proc = None
+        if proc is not None and proc.returncode == 0 and raw_wav.is_file():
             return
 
     ml_root = Path(ml_root_str) if ml_root_str else None

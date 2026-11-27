@@ -24,7 +24,9 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from project_manifest import (  # noqa: E402
+    compute_run_params_hash,
     create_manifest,
+    invalidate_stale_stages,
     is_stage_done,
     load_manifest,
     save_manifest,
@@ -91,10 +93,31 @@ def main() -> None:
     out_dir = Path(args.out_dir) if args.out_dir else (ROOT / "output" / song_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    run_params = {
+        "inputs": [str(Path(x).resolve()) for x in args.inputs],
+        "engine": args.engine,
+        "device": args.device,
+        "bpm": args.bpm,
+        "time_sig": (args.beats_per_bar, args.beat_type),
+        "tempo_mode": args.mode,
+        "first_downbeat": args.first_downbeat,
+        "subdivision": args.grid,
+        "style": args.style,
+        "key_fifths": args.key_fifths,
+        "title": title,
+        "skip_pdf": bool(args.skip_pdf),
+        "auto_repair": bool(args.auto_repair),
+    }
+
     manifest_path = out_dir / "project_manifest.json"
     if args.resume and manifest_path.is_file():
         manifest = load_manifest(manifest_path)
-        print(f"Resuming from {manifest_path}")
+        invalidated = invalidate_stale_stages(manifest, run_params)
+        if invalidated:
+            print(f"Resuming from {manifest_path} (parameters changed; invalidating: {', '.join(invalidated)})")
+            save_manifest(manifest_path, manifest)
+        else:
+            print(f"Resuming from {manifest_path} (params hash={manifest.get('run_params_hash')})")
     else:
         manifest = create_manifest(
             inputs=args.inputs,
@@ -104,6 +127,8 @@ def main() -> None:
             engine=args.engine,
             device=args.device,
         )
+        manifest["run_params"] = run_params
+        manifest["run_params_hash"] = compute_run_params_hash(run_params)
         save_manifest(manifest_path, manifest)
 
     py = sys.executable
@@ -249,40 +274,39 @@ def main() -> None:
     key_fifths = str(resolved_key_fifths)
 
     # Stage 2: Harmonic Pitch & Ghost Audit (+ automatic --clean-midi)
+    # P1-5: Reads score.mid + TempoMap directly without MuseScore MIDI->MusicXML round-trip
     midi_for_stage3 = baseline_mid
-    if baseline_xml and Path(baseline_xml).is_file():
+    if baseline_mid.is_file():
         if not (args.resume and is_stage_done(manifest, "stage2_pitch_audit") and pitch_audit_json.is_file()):
-            _run_step(
-                "Stage 2: Harmonic Pitch Audit & Ghost Cleaning",
-                [
-                    py,
-                    str(SCRIPTS_DIR / "stage2_pitch_audit.py"),
-                    "--audio",
-                    str(best_audio),
-                    "--xml",
-                    str(baseline_xml),
-                    "--bpm",
-                    bpm,
-                    "--beats-per-bar",
-                    bpb,
-                    "--beat-type",
-                    btype,
-                    "--first-downbeat",
-                    t0,
-                    "--stage1-cal",
-                    str(cal_json),
-                    "--midi",
-                    str(baseline_mid),
-                    "--clean-midi",
-                    str(cleaned_mid),
-                    "--style-profile",
-                    str(style_profile_arg),
-                    "--key-fifths",
-                    key_fifths,
-                    "--out",
-                    str(pitch_audit_json),
-                ],
-            )
+            s2_cmd = [
+                py,
+                str(SCRIPTS_DIR / "stage2_pitch_audit.py"),
+                "--audio",
+                str(best_audio),
+                "--midi",
+                str(baseline_mid),
+                "--bpm",
+                bpm,
+                "--beats-per-bar",
+                bpb,
+                "--beat-type",
+                btype,
+                "--first-downbeat",
+                t0,
+                "--stage1-cal",
+                str(cal_json),
+                "--clean-midi",
+                str(cleaned_mid),
+                "--style-profile",
+                str(style_profile_arg),
+                "--key-fifths",
+                key_fifths,
+                "--out",
+                str(pitch_audit_json),
+            ]
+            if baseline_xml and Path(baseline_xml).is_file():
+                s2_cmd.extend(["--xml", str(baseline_xml)])
+            _run_step("Stage 2: Harmonic Pitch Audit & Ghost Cleaning", s2_cmd)
             manifest["artifacts"]["pitch_audit_json"] = str(pitch_audit_json)
             manifest["artifacts"]["cleaned_mid"] = str(cleaned_mid)
             set_stage_status(manifest, "stage2_pitch_audit", "done")
@@ -290,6 +314,7 @@ def main() -> None:
         if cleaned_mid.is_file():
             midi_for_stage3 = cleaned_mid
     else:
+        print("[SKIPPED] Stage 2 Pitch Audit: baseline score.mid not found")
         set_stage_status(manifest, "stage2_pitch_audit", "skipped")
         save_manifest(manifest_path, manifest)
 
