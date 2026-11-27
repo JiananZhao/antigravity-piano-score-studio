@@ -260,7 +260,7 @@ def test_v3_manifest_roundtrip_and_transkun_quantization(tmp_path: Path) -> None
 
 
 def test_krumhansl_schmuckler_key_detection() -> None:
-    """Verify Krumhansl-Schmuckler detects C major, A minor, and Bb major accurately."""
+    """Verify Krumhansl-Schmuckler detects C major, A minor, Bb major, and D minor accurately."""
     sa = _load_script("style_analyzer.py")
     detect_key_krumhansl_schmuckler = sa.detect_key_krumhansl_schmuckler
 
@@ -328,6 +328,7 @@ def test_musical_dna_and_style_classification() -> None:
     baroque_notes = []
     for step in range(64):
         t = step * 0.25
+        # Upper voice 16th-note motoric line overlapping lower voice staggered by 0.25 beat
         baroque_notes.append((72 + (step % 5), t, t + 0.5, 82))
         if step % 2 == 1:
             baroque_notes.append((55 + (step % 4), t, t + 0.75, 80))
@@ -340,6 +341,7 @@ def test_musical_dna_and_style_classification() -> None:
     for beat in range(24):
         t0 = float(beat)
         t_sw = t0 + 0.67
+        # Chromatic shell/tension pitches (Eb, F#, Bb, Db, Ab)
         jazz_notes.append((60 + (beat % 12), t0, t0 + 0.60, 86))
         jazz_notes.append((63 + ((beat * 5) % 12), t_sw, t_sw + 0.28, 82))
     dna_jz = extract_musical_dna(jazz_notes, tempo_map_dict={"bar_tempos_bpm": [128.0] * 6})
@@ -568,3 +570,76 @@ def test_p1_1_and_p1_3_rubato_grid_coverage_and_note_dedup(tmp_path: Path) -> No
     out_mid = tmp_path / "dedup.mid"
     q_res = te.quantize_performance_midi(perf_notes, tmap, grid=2, beats_per_bar=4, beat_type=4, out_mid=out_mid)
     assert q_res["note_count"] == 1
+
+
+def test_p1_5_stage2_parse_midi_onsets_direct_and_pickup(tmp_path: Path) -> None:
+    """P1-5: Stage 2 parses onsets directly from quantized MIDI + TempoMap without MuseScore XML."""
+    s2 = _load_script("stage2_pitch_audit.py")
+    tm = _load_script("tempo_map.py")
+    parse_midi_onsets = s2.parse_midi_onsets
+    load_tempo_map = tm.load_tempo_map
+
+    mid_path = tmp_path / "score.mid"
+    mid = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    mid.tracks.append(tr)
+    # With has_pickup=True in 4/4 (bar_quarters=4.0), Bar 0 beat 4 is tick 1440 (score_q = -1.0),
+    # Bar 1 beat 1 is tick 1920 (score_q = 0.0).
+    tr.append(mido.Message("note_on", note=64, velocity=80, time=1440))
+    tr.append(mido.Message("note_off", note=64, velocity=0, time=480))
+    tr.append(mido.Message("note_on", note=60, velocity=90, time=0))
+    tr.append(mido.Message("note_off", note=60, velocity=0, time=480))
+    mid.save(str(mid_path))
+
+    tmap = load_tempo_map(None, 120.0, 4, 4, 1.50)
+    notes = parse_midi_onsets(
+        mid_path, bpm=120.0, beats_per_bar=4, first_downbeat=1.50, beat_type=4, tempo_map=tmap, has_pickup=True
+    )
+    assert len(notes) == 2
+    assert notes[0]["measure"] == 0 and abs(notes[0]["t_on"] - 1.00) < 1e-4
+    assert notes[1]["measure"] == 1 and abs(notes[1]["t_on"] - 1.50) < 1e-4
+
+
+def test_p2_5_manifest_resume_param_hash_invalidation() -> None:
+    """P2-5: Changing --bpm or --engine invalidates Stage 1+ while preserving Stage 0."""
+    pm = _load_script("project_manifest.py")
+    compute_run_params_hash = pm.compute_run_params_hash
+    create_manifest = pm.create_manifest
+    invalidate_stale_stages = pm.invalidate_stale_stages
+    set_stage_status = pm.set_stage_status
+
+    m = create_manifest(["song.wav"], Path("/tmp/out"), "song", "Song")
+    base_params = {"inputs": ["/tmp/song.wav"], "engine": "transkun", "bpm": None, "style": "auto"}
+    m["run_params"] = dict(base_params)
+    m["run_params_hash"] = compute_run_params_hash(base_params)
+    for k in ("stage0_triage", "stage1_calibrate_transcribe", "stage1_5_style_analysis", "stage2_pitch_audit", "stage3_engrave_score"):
+        set_stage_status(m, k, "done")
+
+    assert invalidate_stale_stages(m, dict(base_params)) == []
+
+    changed = dict(base_params, bpm=108.0)
+    inv = invalidate_stale_stages(m, changed)
+    assert "stage0_triage" not in inv
+    assert "stage1_calibrate_transcribe" in inv
+    assert "stage3_engrave_score" in inv
+    assert m["stage_status"]["stage0_triage"] == "done"
+    assert m["stage_status"]["stage1_calibrate_transcribe"] == "pending"
+
+
+def test_p2_6_timeout_expired_graceful_runtime_error(tmp_path: Path, monkeypatch) -> None:
+    """P2-6: TransKun TimeoutExpired is caught and converted to an actionable RuntimeError."""
+    import subprocess
+    te = _load_script("transcription_engines.py")
+
+    fake_wav = tmp_path / "a.wav"
+    fake_wav.write_bytes(b"RIFF")
+
+    def boom(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="transkun", timeout=900)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    try:
+        te.run_transkun_transcribe(fake_wav, tmp_path / "out.mid", device="cpu", pad_sec=0.0)
+        raise AssertionError("Expected RuntimeError on TimeoutExpired")
+    except RuntimeError as exc:
+        assert "timed out" in str(exc).lower()

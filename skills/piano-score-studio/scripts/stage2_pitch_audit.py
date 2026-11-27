@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -94,6 +95,61 @@ def parse_xml_onsets(
                 }
             )
     return notes
+
+
+def parse_midi_onsets(
+    midi_path: Path,
+    bpm: float,
+    beats_per_bar: int,
+    first_downbeat: float,
+    beat_type: int = 4,
+    tempo_map: TempoMap | None = None,
+    has_pickup: bool = False,
+) -> list[dict]:
+    """Parse note onsets directly from quantized score MIDI + TempoMap (P1-5).
+
+    Eliminates the lossy MuseScore MIDI->MusicXML round-trip so Stage 2 works
+    identically with or without MuseScore / --skip-pdf and preserves Bar 0 pickups.
+    """
+    import mido
+
+    mid = mido.MidiFile(str(midi_path))
+    tpb = max(1, int(mid.ticks_per_beat))
+    beat_quarters = 4.0 / float(beat_type)
+    bar_quarters = float(beats_per_bar) * beat_quarters
+    pickup_offset_q = bar_quarters if has_pickup else 0.0
+    q_sec = 60.0 / float(bpm)
+
+    out: list[dict] = []
+    for tr_idx, track in enumerate(mid.tracks):
+        abs_tick = 0
+        for msg in track:
+            abs_tick += msg.time
+            if msg.type == "note_on" and msg.velocity > 0:
+                score_q = (abs_tick / float(tpb)) - pickup_offset_q
+                if tempo_map is not None:
+                    t_on = float(tempo_map.q_to_sec(score_q))
+                else:
+                    t_on = float(first_downbeat) + score_q * q_sec
+                if score_q < -1e-6:
+                    measure = 0
+                    beat = ((score_q + bar_quarters) / beat_quarters) + 1.0
+                else:
+                    measure = int(math.floor(score_q / bar_quarters + 1e-6)) + 1
+                    beat = ((score_q - (measure - 1) * bar_quarters) / beat_quarters) + 1.0
+                staff = 1 if int(msg.note) >= 60 else 2
+                if len(mid.tracks) >= 3 and tr_idx in (1, 2):
+                    staff = tr_idx
+                out.append({
+                    "measure": measure,
+                    "beat": round(max(1.0, beat), 3),
+                    "t_on": t_on,
+                    "midi": int(msg.note),
+                    "name": f"{PC_NAMES[int(msg.note) % 12]}{int(msg.note) // 12 - 1}",
+                    "staff": staff,
+                })
+    out.sort(key=lambda n: (n["t_on"], n["midi"]))
+    return out
 
 
 def harmonic_evidence(mono: np.ndarray, sr: int, t_on: float, midi: int) -> dict:
@@ -229,7 +285,8 @@ def main() -> None:
 
     ap = argparse.ArgumentParser(description="Stage 2 pitch, clash, and ghost-note harmonic audit")
     ap.add_argument("--audio", required=True)
-    ap.add_argument("--xml", required=True)
+    ap.add_argument("--xml", default=None, help="Optional MusicXML path (fallback if --midi is omitted or --prefer-xml is set)")
+    ap.add_argument("--prefer-xml", action="store_true", help="Force parsing onsets from --xml instead of direct --midi + TempoMap")
     ap.add_argument("--bpm", type=float, required=True)
     ap.add_argument("--beats-per-bar", type=int, required=True)
     ap.add_argument("--beat-type", type=int, default=None, choices=(4, 8), help="Optional denominator override (defaults to XML beat-type)")
@@ -242,12 +299,48 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
+    if not args.midi and not args.xml:
+        raise ValueError("Stage 2 requires --midi <score.mid> (preferred) or --xml <score.musicxml>")
+
     data, sr = sf.read(args.audio, dtype="float64", always_2d=True)
     mono = data.mean(axis=1)
-    xml_root = ET.parse(args.xml).getroot()
-    eff_bt = args.beat_type if args.beat_type is not None else int(xml_root.findtext(".//attributes/time/beat-type", "4"))
+    xml_root = ET.parse(args.xml).getroot() if (args.xml and Path(args.xml).is_file()) else None
+    cal_obj = json.loads(Path(args.stage1_cal).read_text(encoding="utf-8")) if (args.stage1_cal and Path(args.stage1_cal).is_file()) else {}
+    cal_section = cal_obj.get("calibration") or {}
+    if args.beat_type is not None:
+        eff_bt = int(args.beat_type)
+    elif cal_section.get("beat_type") is not None:
+        eff_bt = int(cal_section["beat_type"])
+    elif xml_root is not None:
+        eff_bt = int(xml_root.findtext(".//attributes/time/beat-type", "4"))
+    else:
+        eff_bt = 4
+
+    hp_val = cal_section.get("has_pickup")
+    if hp_val is not None:
+        has_pickup = bool(hp_val)
+    elif xml_root is not None:
+        has_pickup = any(m.attrib.get("number") == "0" and m.attrib.get("implicit") == "yes" for m in xml_root.findall(".//part/measure"))
+    else:
+        has_pickup = False
+
     tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, eff_bt, args.first_downbeat)
-    notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, beat_type=args.beat_type, tempo_map=tmap)
+    if args.midi and Path(args.midi).is_file() and not args.prefer_xml:
+        onset_source = "midi"
+        notes = parse_midi_onsets(
+            Path(args.midi),
+            args.bpm,
+            args.beats_per_bar,
+            args.first_downbeat,
+            beat_type=eff_bt,
+            tempo_map=tmap,
+            has_pickup=has_pickup,
+        )
+    else:
+        if not args.xml:
+            raise ValueError("--prefer-xml requires --xml <score.musicxml>")
+        onset_source = "xml"
+        notes = parse_xml_onsets(Path(args.xml), args.bpm, args.beats_per_bar, args.first_downbeat, beat_type=args.beat_type, tempo_map=tmap)
 
     profile = load_style_profile(args.style_profile) if args.style_profile else None
     pa_cfg = (profile or {}).get("pitch_audit", {})
@@ -303,16 +396,7 @@ def main() -> None:
     if args.clean_midi:
         if not args.midi:
             raise ValueError("--clean-midi requires --midi <input.mid>")
-        has_pickup = False
-        if args.stage1_cal and Path(args.stage1_cal).is_file():
-            cal_obj = json.loads(Path(args.stage1_cal).read_text(encoding="utf-8"))
-            hp_val = (cal_obj.get("calibration") or {}).get("has_pickup")
-            if hp_val is not None:
-                has_pickup = bool(hp_val)
-            else:
-                has_pickup = any(m.attrib.get("number") == "0" and m.attrib.get("implicit") == "yes" for m in xml_root.findall(".//part/measure"))
-        else:
-            has_pickup = any(m.attrib.get("number") == "0" and m.attrib.get("implicit") == "yes" for m in xml_root.findall(".//part/measure"))
+        # has_pickup already resolved above from stage1_calibration.json or XML
         removed_ghosts = clean_ghost_notes_from_midi(
             Path(args.midi), Path(args.clean_midi), confirmed_ghosts, tempo_map=tmap, has_pickup=has_pickup
         )
@@ -321,6 +405,7 @@ def main() -> None:
 
     report = {
         "stage": "stage_2_transcription_pitch_audit",
+        "onset_source": onset_source,
         "style_profile": (profile or {}).get("profile_id", "default"),
         "thresholds": {"ghost_f0_gap_db": ghost_f0_gap_db, "ghost_og_db": ghost_og_db, "weak_oos_snr_db": weak_oos_snr_db},
         "total_onsets": len(notes),
