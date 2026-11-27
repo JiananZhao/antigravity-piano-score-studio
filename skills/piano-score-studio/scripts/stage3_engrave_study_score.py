@@ -113,7 +113,7 @@ def compute_grid_metrics(beats_per_bar: int, beat_type: int, grid: int) -> tuple
     return divisions, bar_slots, beat_slots, beam_group_slots
 
 
-def load_midi_notes(path: Path, divisions: int, bar_slots: int) -> tuple[list[RawNote], int]:
+def load_midi_notes(path: Path, divisions: int, bar_slots: int, has_pickup: bool | None = None) -> tuple[list[RawNote], int]:
     """Load MIDI notes quantized to the chosen division grid; detect Bar 0 pickup if first bar is partial."""
     mid = mido.MidiFile(path)
     ticks_per_slot = mid.ticks_per_beat / float(divisions)
@@ -150,7 +150,10 @@ def load_midi_notes(path: Path, divisions: int, bar_slots: int) -> tuple[list[Ra
     if not notes:
         return notes, 0
     first_slot = notes[0].start_slot
-    pickup_start = first_slot if (0 < first_slot < bar_slots) else 0
+    if has_pickup is False:
+        pickup_start = 0
+    else:
+        pickup_start = first_slot if (0 < first_slot < bar_slots) else 0
     return notes, pickup_start
 
 
@@ -404,6 +407,60 @@ def simplify_bar_hand(
     return v1, None
 
 
+def reconcile_cross_bar_ties(
+    bar_voices: dict[tuple[int, int], tuple[list[ChordEvent], list[ChordEvent] | None]],
+    start_bar: int,
+    max_bar: int,
+    bar_slots: int,
+    pickup_start: int,
+) -> None:
+    """Guarantee zero orphaned cross-bar tie_start/tie_stop pairs after per-bar simplification."""
+    for staff in (1, 2):
+        prev_outgoing: set[int] = set()
+        for b in range(start_bar, max_bar + 1):
+            bar_len = (bar_slots - pickup_start) if b == 0 else bar_slots
+            v1, v2 = bar_voices.get((b, staff), ([], None))
+            all_evs = list(v1) + (list(v2) if v2 else [])
+
+            # 1. Clear any tie_stop on slot 0 not backed by an actual outgoing tie_start from bar b-1
+            matched_incoming: set[int] = set()
+            for ev in all_evs:
+                for seg in ev.segs:
+                    if seg.tie_stop:
+                        if ev.slot == 0 and seg.pitch in prev_outgoing:
+                            matched_incoming.add(seg.pitch)
+                        else:
+                            seg.tie_stop = False
+
+            # 2. If bar b-1 emitted a tie_start whose pitch vanished in bar b, clear it retroactively
+            unmatched_prev = prev_outgoing - matched_incoming
+            if unmatched_prev and b > start_bar:
+                pv1, pv2 = bar_voices.get((b - 1, staff), ([], None))
+                for pev in list(pv1) + (list(pv2) if pv2 else []):
+                    for pseg in pev.segs:
+                        if pseg.pitch in unmatched_prev and pseg.tie_start:
+                            pseg.tie_start = False
+
+            # 3. Record pitches that genuinely reach bar_len with tie_start=True
+            cur_outgoing: set[int] = set()
+            for ev in all_evs:
+                reaches_end = (ev.slot + ev.dur == bar_len)
+                for seg in ev.segs:
+                    if seg.tie_start and not reaches_end:
+                        seg.tie_start = False
+                    elif seg.tie_start and reaches_end:
+                        cur_outgoing.add(seg.pitch)
+            prev_outgoing = cur_outgoing
+
+        # 4. Final bar cannot have outgoing tie_start
+        if prev_outgoing:
+            lv1, lv2 = bar_voices.get((max_bar, staff), ([], None))
+            for lev in list(lv1) + (list(lv2) if lv2 else []):
+                for lseg in lev.segs:
+                    if lseg.tie_start:
+                        lseg.tie_start = False
+
+
 def split_duration(
     slot: int,
     dur: int,
@@ -418,7 +475,7 @@ def split_duration(
             (6, "half", True, None, lambda c: (not is_rest or beat_slots == 3) and c == 0),
             (4, "half", False, None, lambda c: c % 2 == 0 and beat_slots != 3),
             (3, "quarter", True, None, lambda c: (c % beat_slots == 0) if (not is_rest or beat_slots == 3) else False),
-            (2, "quarter", False, None, lambda c: c % 2 == 0),
+            (2, "quarter", False, None, lambda c: (c % 2 == 0) or (not is_rest and beat_slots == 3 and (c % 3) in (0, 1))),
             (1, "eighth", False, None, lambda c: True),
         ]
     elif divisions == 4:
@@ -427,7 +484,7 @@ def split_duration(
             (12, "half", True, None, lambda c: (not is_rest or beat_slots == 6) and c == 0),
             (8, "half", False, None, lambda c: c % 4 == 0 and beat_slots != 6),
             (6, "quarter", True, None, lambda c: (c % 2 == 0) if not is_rest else (beat_slots == 6 and c % 6 == 0)),
-            (4, "quarter", False, None, lambda c: c % 4 == 0),
+            (4, "quarter", False, None, lambda c: (c % 4 == 0) or (not is_rest and beat_slots == 6 and (c % 6) in (0, 2))),
             (3, "eighth", True, None, lambda c: (not is_rest) and c % 2 == 0),
             (2, "eighth", False, None, lambda c: c % 2 == 0),
             (1, "16th", False, None, lambda c: True),
@@ -589,7 +646,7 @@ def main() -> None:
     ap.add_argument("--grid", type=int, default=DIVISIONS, choices=(2, 3, 4), help="Subdivisions per quarter note (2=8th, 3=triplet-8th, 4=16th)")
     ap.add_argument("--first-downbeat", type=float, required=True)
     ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
-    ap.add_argument("--key-fifths", type=int, default=-2)
+    ap.add_argument("--key-fifths", type=int, default=0)
     ap.add_argument("--dynamics-csv", default=None)
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
     ap.add_argument("--bar-overrides", default=None, help="Optional project_manifest.json or bar_overrides JSON for local per-bar fixes")
@@ -599,7 +656,13 @@ def main() -> None:
     args = ap.parse_args()
 
     divisions, bar_slots, beat_slots, beam_group_slots = compute_grid_metrics(args.beats_per_bar, args.beat_type, args.grid)
-    notes, pickup_start = load_midi_notes(Path(args.midi), divisions, bar_slots)
+    cal_has_pickup = None
+    if args.stage1_cal and Path(args.stage1_cal).is_file():
+        cal_obj = json.loads(Path(args.stage1_cal).read_text(encoding="utf-8"))
+        hp = (cal_obj.get("calibration") or {}).get("has_pickup")
+        if hp is not None:
+            cal_has_pickup = bool(hp)
+    notes, pickup_start = load_midi_notes(Path(args.midi), divisions, bar_slots, has_pickup=cal_has_pickup)
     if not notes:
         raise ValueError(f"No playable notes found in MIDI: {args.midi}")
     bar1_slot = bar_slots if pickup_start > 0 else 0
@@ -667,6 +730,23 @@ def main() -> None:
     part = ET.SubElement(root, "part", id="P1")
     start_bar = 0 if pickup_start > 0 else 1
     sys_count = 0
+    pedal_style = str(((profile or {}).get("dynamics") or {}).get("pedal_style", "legato_harmonic"))
+
+    bar_voices: dict[tuple[int, int], tuple[list[ChordEvent], list[ChordEvent] | None]] = {}
+    for b in range(start_bar, max_bar + 1):
+        bar_len_pre = (bar_slots - pickup_start) if b == 0 else bar_slots
+        b_global_pre = pickup_start if b == 0 else (bar1_slot + (b - 1) * bar_slots)
+        bar_ov = bar_overrides.get(b, {})
+        bar_bridge = bool(bar_ov.get("enable_gap_bridging", enable_gap_bridging))
+        bar_voices[(b, 1)] = simplify_bar_hand(
+            bars_map.get((b, 1), []), b, b_global_pre, bar_len_pre, slot_rms, divisions,
+            enable_gap_bridging=bar_bridge, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
+        )
+        bar_voices[(b, 2)] = simplify_bar_hand(
+            bars_map.get((b, 2), []), b, b_global_pre, bar_len_pre, slot_rms, divisions,
+            enable_gap_bridging=bar_bridge, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
+        )
+    reconcile_cross_bar_ties(bar_voices, start_bar, max_bar, bar_slots, pickup_start)
 
     for b in range(start_bar, max_bar + 1):
         bar_len = (bar_slots - pickup_start) if b == 0 else bar_slots
@@ -710,7 +790,7 @@ def main() -> None:
             quarter_bpm = args.bpm * (4.0 / args.beat_type)
             ET.SubElement(d_top, "sound", tempo=str(round(quarter_bpm, 2)))
 
-        if b == 1:
+        if b == 1 and pedal_style != "dry_articulated":
             dp = ET.SubElement(m_el, "direction", placement="below")
             ET.SubElement(ET.SubElement(dp, "direction-type"), "words", {"font-style": "italic", "font-size": "10", "relative-y": "-14"}).text = "con pedale"
             ET.SubElement(dp, "staff").text = "2"
@@ -720,16 +800,8 @@ def main() -> None:
             ET.SubElement(ET.SubElement(ET.SubElement(dd, "direction-type"), "dynamics", {"relative-y": "-18"}), val)
             ET.SubElement(dd, "staff").text = "1"
 
-        bar_ov = bar_overrides.get(b, {})
-        bar_bridge = bool(bar_ov.get("enable_gap_bridging", enable_gap_bridging))
-        rh_v1, rh_v2 = simplify_bar_hand(
-            bars_map.get((b, 1), []), b, b_global, bar_len, slot_rms, divisions,
-            enable_gap_bridging=bar_bridge, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
-        )
-        lh_v1, lh_v2 = simplify_bar_hand(
-            bars_map.get((b, 2), []), b, b_global, bar_len, slot_rms, divisions,
-            enable_gap_bridging=bar_bridge, bridge_rms_db=bridge_rms_db, anchor_min_dur_beats=anchor_min_dur_beats,
-        )
+        rh_v1, rh_v2 = bar_voices[(b, 1)]
+        lh_v1, lh_v2 = bar_voices[(b, 2)]
 
         def emit_staff(v1: list[ChordEvent], v2: list[ChordEvent] | None, staff: int, v_id1: int, v_id2: int) -> None:
             acc_state: dict[tuple[str, int], int] = {}
@@ -811,7 +883,9 @@ def main() -> None:
                                 ET.SubElement(n, "beam", number="1").text = at.beam1
                             if idx == 0 and at.beam2:
                                 ET.SubElement(n, "beam", number="2").text = at.beam2
-                            if ts or te or arp:
+                            tup_start = bool(at.tuplet and idx == 0 and (at.slot % beat_slots == 0))
+                            tup_stop = bool(at.tuplet and idx == 0 and ((at.slot + at.dur) % beat_slots == 0))
+                            if ts or te or arp or tup_start or tup_stop:
                                 nts = ET.SubElement(n, "notations")
                                 if ts:
                                     ET.SubElement(nts, "tied", type="stop")
@@ -819,6 +893,10 @@ def main() -> None:
                                     ET.SubElement(nts, "tied", type="start")
                                 if arp:
                                     ET.SubElement(nts, "arpeggiate")
+                                if tup_start:
+                                    ET.SubElement(nts, "tuplet", type="start")
+                                if tup_stop:
+                                    ET.SubElement(nts, "tuplet", type="stop")
 
             write_atoms(build_voice_atoms(v1, bar_len, v2, divisions, beat_slots, beam_group_slots), v_id1, "up" if v2 else None)
             if v2:
