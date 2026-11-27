@@ -643,3 +643,49 @@ def test_p2_6_timeout_expired_graceful_runtime_error(tmp_path: Path, monkeypatch
         raise AssertionError("Expected RuntimeError on TimeoutExpired")
     except RuntimeError as exc:
         assert "timed out" in str(exc).lower()
+
+
+def test_p2_1_setup_assets_blocks_zip_and_tar_path_traversal(tmp_path: Path) -> None:
+    """P2-1: safe_extract_tar and safe_extract_zip must reject path-traversal entries."""
+    import io
+    import tarfile
+    import zipfile
+
+    sa = _load_script("setup_assets.py")
+    dest = tmp_path / "extract"
+    dest.mkdir()
+
+    # 1. Malicious ZipSlip archive
+    bad_zip = tmp_path / "evil.zip"
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("../escape.txt", "boom")
+    with zipfile.ZipFile(bad_zip, "r") as zf:
+        try:
+            sa.safe_extract_zip(zf, dest)
+            raise AssertionError("Expected ValueError for ZipSlip entry")
+        except ValueError as exc:
+            assert "traversal" in str(exc).lower() or "unsafe" in str(exc).lower()
+
+    # 2. Malicious tar path traversal archive
+    bad_tar = tmp_path / "evil.tar.gz"
+    with tarfile.open(bad_tar, "w:gz") as tf:
+        payload = b"boom"
+        info = tarfile.TarInfo(name="../escape_tar.txt")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    with tarfile.open(bad_tar, "r:gz") as tf:
+        try:
+            sa.safe_extract_tar(tf, dest)
+            raise AssertionError("Expected ValueError for tar traversal entry")
+        except ValueError as exc:
+            assert "traversal" in str(exc).lower() or "unsafe" in str(exc).lower()
+
+    # 3. Clean archive + verify_sha256
+    good_zip = tmp_path / "good.zip"
+    with zipfile.ZipFile(good_zip, "w") as zf:
+        zf.writestr("sub/ok.txt", "hello")
+    digest = sa.sha256_file(good_zip)
+    assert sa.verify_sha256(good_zip, digest, label="good.zip") == digest
+    with zipfile.ZipFile(good_zip, "r") as zf:
+        sa.safe_extract_zip(zf, dest)
+    assert (dest / "sub" / "ok.txt").read_text(encoding="utf-8") == "hello"
