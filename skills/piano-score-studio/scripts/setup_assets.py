@@ -16,7 +16,7 @@ from pathlib import Path
 
 SALAMANDER_URL = os.environ.get(
     "SALAMANDER_ARCHIVE_URL",
-    "https://github.com/sfzinstruments/SalamanderGrandPianoV3/archive/refs/heads/master.tar.gz",
+    "https://github.com/sfzinstruments/SalamanderGrandPiano/archive/refs/heads/master.tar.gz",
 )
 SFIZZ_LATEST_API = "https://api.github.com/repos/sfztools/sfizz/releases/latest"
 MUSCRIPTOR_REPO_ID = "MuScriptor/muscriptor-medium"
