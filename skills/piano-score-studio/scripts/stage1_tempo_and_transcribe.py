@@ -351,6 +351,12 @@ def calibrate_bpm_and_mode(
             if score > best_score:
                 best_score, best_bpm = score, local_best_b
 
+        # Guard: fixed-tempo circular |R| < 0.45 is statistically noise on rubato / expressive pieces.
+        # Never let noise pick a bogus 1.5x / 2x / 0.5x multiplier that corrupts beat_this's true pulse!
+        max_cand_r = max((float(c["circular_R"]) for c in cand_summary), default=0.0)
+        if max_cand_r < 0.45:
+            best_bpm = b0
+
         r_val, max_drift_ms, phase_shift = eval_circular_bpm(times, weights, best_bpm, ref_t, dur_s)
 
     steady_recommended = (r_val >= 0.70) and (max_drift_ms <= 30.0)
