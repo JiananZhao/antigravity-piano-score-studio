@@ -233,13 +233,25 @@ def run_transkun_transcribe(
         if weight_path:
             cmd.extend(["--weight", str(weight_path)])
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=900)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=900)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"TransKun v2 transcription timed out after {exc.timeout}s on device='{tk_device}'. "
+                "For long recordings on CPU, consider using --device cuda or splitting the audio."
+            ) from exc
         if proc.returncode != 0 and tk_device != "cpu":
             # Graceful fallback to CPU if CUDA invocation failed
             cmd_cpu = [sys.executable, "-m", "transkun.transcribe", str(in_audio), str(tmp_mid), "--device", "cpu"]
             if weight_path:
                 cmd_cpu.extend(["--weight", str(weight_path)])
-            proc = subprocess.run(cmd_cpu, capture_output=True, text=True, errors="replace", timeout=900)
+            try:
+                proc = subprocess.run(cmd_cpu, capture_output=True, text=True, errors="replace", timeout=900)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"TransKun v2 CPU fallback timed out after {exc.timeout}s. "
+                    "Consider using a GPU (--device cuda) or shorter audio segments."
+                ) from exc
 
         if proc.returncode != 0 or not tmp_mid.is_file():
             raise RuntimeError(f"TransKun v2 transcription failed: {proc.stderr or proc.stdout}")
