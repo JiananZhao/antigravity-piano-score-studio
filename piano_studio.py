@@ -81,6 +81,7 @@ def main() -> None:
     ap.add_argument("--skip-pdf", action="store_true", help="Skip MuseScore PDF export (MusicXML only)")
     ap.add_argument("--skip-render", action="store_true", help="Skip Stage 4 Salamander audio render & Stage 5 A/B")
     ap.add_argument("--resume", action="store_true", help="Resume from existing project_manifest.json in --out-dir")
+    ap.add_argument("--auto-repair", action="store_true", help="Run 1 bounded local bar_overrides repair pass if Eval Gate flags repairable bar issues")
     args = ap.parse_args()
 
     first_in = Path(args.inputs[0])
@@ -352,6 +353,8 @@ def main() -> None:
             str(dynamics_csv),
             "--style-profile",
             str(style_profile_arg),
+            "--bar-overrides",
+            str(manifest_path),
             "--out-xml",
             str(study_xml),
         ]
@@ -396,6 +399,10 @@ def main() -> None:
             key_fifths,
             "--song-name",
             song_name,
+            "--style-profile",
+            str(style_profile_arg),
+            "--transkun-midi",
+            str(baseline_mid),
             "--out-dir",
             str(deliverables_dir),
         ]
@@ -476,6 +483,44 @@ def main() -> None:
             manifest["artifacts"]["eval_report_json"] = str(eval_json)
             set_stage_status(manifest, "stage5_ab_and_eval", "done" if proc.returncode == 0 else "failed")
             save_manifest(manifest_path, manifest)
+            if proc.returncode != 0 and args.auto_repair:
+                print("\n=== [Phase 3 Local Repair Loop: Proposing bar_overrides] ===")
+                _run_step(
+                    "Bar Repair Proposal",
+                    [
+                        py,
+                        str(SCRIPTS_DIR / "bar_repair_loop.py"),
+                        "--manifest",
+                        str(manifest_path),
+                        "--eval-report",
+                        str(eval_json),
+                        "--pitch-audit",
+                        str(pitch_audit_json),
+                        "--xml",
+                        str(study_xml),
+                        "--write",
+                    ],
+                )
+                manifest = load_manifest(manifest_path)
+                if manifest.get("bar_overrides"):
+                    print("Re-engraving Stage 3 & re-evaluating with local bar_overrides...")
+                    s3_retry = [
+                        py, str(SCRIPTS_DIR / "stage3_engrave_study_score.py"),
+                        "--midi", str(midi_for_stage3), "--audio", str(best_audio),
+                        "--title", title, "--bpm", bpm, "--beats-per-bar", bpb, "--beat-type", btype,
+                        "--grid", grid, "--first-downbeat", t0, "--stage1-cal", str(cal_json),
+                        "--key-fifths", key_fifths, "--dynamics-csv", str(dynamics_csv),
+                        "--style-profile", str(style_profile_arg), "--bar-overrides", str(manifest_path),
+                        "--out-xml", str(study_xml),
+                    ]
+                    if not args.skip_pdf:
+                        s3_retry.extend(["--out-pdf", str(study_pdf)])
+                    if args.musescore:
+                        s3_retry.extend(["--musescore", args.musescore])
+                    _run_step("Stage 3 (Local Repair Pass)", s3_retry)
+                    proc = subprocess.run(eval_cmd)
+                    set_stage_status(manifest, "stage5_ab_and_eval", "done" if proc.returncode == 0 else "failed")
+                    save_manifest(manifest_path, manifest)
             if proc.returncode != 0:
                 print(f"\nPipeline finished with Eval Gate warnings/failures. Inspect: {eval_json}")
                 sys.exit(proc.returncode)

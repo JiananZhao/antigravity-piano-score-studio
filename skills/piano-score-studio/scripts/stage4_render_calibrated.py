@@ -23,6 +23,12 @@ import soundfile as sf
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tempo_map import TempoMap, load_tempo_map
+from style_analyzer import load_style_profile
+from pedal_and_velocity import (
+    compute_dynamic_pedal_events,
+    fuse_transkun_velocities,
+    read_midi_velocity_events,
+)
 
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 FIFTHS_TO_KEY = {
@@ -312,6 +318,8 @@ def main() -> None:
     ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--song-name", default="PianoPiece")
+    ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
+    ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities for touch fusion")
     ap.add_argument("--config", default=None)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
@@ -390,6 +398,17 @@ def main() -> None:
                 vel = min(vel, bar_rh_mean[m] - 14.0)
             n["calc_vel"] = int(np.clip(round(vel), 26, 74))
 
+    profile = load_style_profile(args.style_profile) if args.style_profile else None
+    dyn_cfg = (profile or {}).get("dynamics", {})
+    pedal_style = str(dyn_cfg.get("pedal_style", "legato_harmonic"))
+    lh_ceiling_vel = int(dyn_cfg.get("lh_ceiling_vel", 90))
+
+    if args.transkun_midi and Path(args.transkun_midi).is_file():
+        src_vels = read_midi_velocity_events(Path(args.transkun_midi))
+        fused_cnt = fuse_transkun_velocities(notes, src_vels, alpha=0.55, lh_ceiling_vel=lh_ceiling_vel)
+        if fused_cnt > 0:
+            print(f"Stage 4 TransKun velocity fusion applied to {fused_cnt}/{len(notes)} notes (lh_ceiling={lh_ceiling_vel})")
+
     # Round 1 static dynamics check
     rh_med = float(np.median([n["calc_vel"] for n in rh_all])) if rh_all else 0.0
     lh_med = float(np.median([n["calc_vel"] for n in lh_all])) if lh_all else 0.0
@@ -418,13 +437,16 @@ def main() -> None:
             dur = max(0.14, n["et"] - st) * (0.98 if n["staff"] == 1 else 1.0)
             render_notes.append({"sample": max(0, int(round(st * rate))), "duration_samples": int(round(dur * rate)), "note": n["pitch"], "velocity": round(n.get("calc_vel", 64) / 127.0, 4), "channel": 1, "staff": n["staff"]})
 
-    controllers = []
-    for m in range(1, max_bar + 1):
-        tb, _ = tmap.bar_bounds_sec(m)
-        controllers.append({"sample": max(0, int(round((tb - 0.018) * rate))), "channel": 1, "controller": 64, "value": 0})
-        controllers.append({"sample": int(round((tb + 0.028) * rate)), "channel": 1, "controller": 64, "value": 127})
     _, t_end = tmap.bar_bounds_sec(max_bar)
-    controllers.append({"sample": int(round((t_end + 0.10) * rate)), "channel": 1, "controller": 64, "value": 0})
+    controllers = compute_dynamic_pedal_events(
+        notes,
+        tempo_map=tmap,
+        max_bar=max_bar,
+        rate=rate,
+        pedal_style=pedal_style,
+        beats_per_bar=args.beats_per_bar,
+        beat_type=beat_type,
+    )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
