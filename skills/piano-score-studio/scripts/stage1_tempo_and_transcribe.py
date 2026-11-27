@@ -439,6 +439,10 @@ def calibrate_meter_and_downbeat(
     # Evaluate candidate bar cycles
     if bpb_override is not None:
         candidates = [(int(bpb_override), int(beat_type_override or 4))]
+    elif beat_type_override == 8:
+        candidates = [(6, 8), (12, 8)]
+    elif beat_type_override == 4:
+        candidates = [(4, 4), (3, 4), (2, 4)]
     else:
         candidates = [(4, 4), (3, 4), (6, 8), (2, 4)]
 
@@ -448,11 +452,11 @@ def calibrate_meter_and_downbeat(
     best_total = -1e9
 
     for bpb, btype in candidates:
-        # In 6/8 when beat_this tracked dotted-quarter beats (bpm ~ 45..95), each bar has 2 dotted-quarter beats -> 6 eighths
-        # When beat_this tracked eighth beats (bpm ~ 110..210), each bar has 6 tracked beats
+        # In 6/8 or 12/8 when beat_this tracked dotted-quarter beats (bpm < 105), each bar has bpb/3 compound beats
+        # When beat_this tracked eighth beats (bpm >= 105), each bar has bpb tracked beats
         cycle_len = bpb
-        if btype == 8 and bpb == 6 and bpm < 105.0:
-            cycle_len = 2  # 2 compound beats = 6 eighth notes
+        if btype == 8 and bpb % 3 == 0 and bpm < 105.0:
+            cycle_len = bpb // 3
 
         phase_scores = []
         for p in range(cycle_len):
@@ -502,10 +506,10 @@ def calibrate_meter_and_downbeat(
             best_phase = top_p
 
     sel_bpb, sel_btype = best_meter
-    # Convert beat-unit BPM when 6/8 was tracked at dotted-quarter pulse (cycle_len == 2)
-    if sel_btype == 8 and sel_bpb == 6 and bpm < 105.0:
+    # Convert beat-unit BPM when compound /8 meter was tracked at dotted-quarter pulse
+    if sel_btype == 8 and sel_bpb % 3 == 0 and bpm < 105.0:
         bpm_for_meter = bpm * 3.0  # eighth-note BPM = 3 * dotted-quarter BPM
-        bar_s = 2.0 * beat_s
+        bar_s = (sel_bpb / 3.0) * beat_s
     else:
         bpm_for_meter = bpm
         bar_s = sel_bpb * (60.0 / bpm_for_meter)
@@ -531,6 +535,49 @@ def calibrate_meter_and_downbeat(
         "pickup_sec": round(pickup_sec, 4),
         "meter_scores": meter_scores,
     }
+
+
+def resample_beats_to_quarter_pulse(
+    beats: np.ndarray,
+    tracked_bpm: float,
+    quarter_bpm: float,
+    first_downbeat: float,
+) -> tuple[np.ndarray, float]:
+    """Resample tracked beat_this beat times onto the quarter-note pulse expected by MuScriptor.
+
+    Handles 6/8 / 12/8 compound meters (1 dotted-quarter beat -> 1.5 quarter notes, or 1 eighth
+    beat -> 0.5 quarter notes) as well as half/double-time BPM adjustments while keeping every
+    barline anchored on `first_downbeat`.
+    """
+    beats = np.asarray(beats, dtype=np.float64)
+    if len(beats) < 2 or tracked_bpm <= 0.0 or quarter_bpm <= 0.0:
+        return beats, 1.0
+
+    raw_ratio = float(quarter_bpm) / float(tracked_bpm)
+    # Snap to exact musical multipliers when within 8% so barlines remain locked to real downbeats
+    clean_ratios = (0.25, 0.5, 2.0 / 3.0, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
+    nearest_clean = min(clean_ratios, key=lambda r: abs(raw_ratio - r) / r)
+    quarter_per_tracked = nearest_clean if abs(raw_ratio - nearest_clean) / nearest_clean <= 0.08 else raw_ratio
+
+    if math.isclose(quarter_per_tracked, 1.0, rel_tol=1e-4):
+        return beats, 1.0
+
+    k0 = int(np.argmin(np.abs(beats - first_downbeat)))
+    q_offset_k0 = (float(beats[k0]) - float(first_downbeat)) * (quarter_bpm / 60.0)
+    if abs(q_offset_k0) <= 0.25:
+        q_offset_k0 = 0.0
+    else:
+        q_offset_k0 = round(q_offset_k0 * 2.0) / 2.0
+
+    tracked_qpos = q_offset_k0 + (np.arange(len(beats), dtype=np.float64) - float(k0)) * quarter_per_tracked
+    q_min = math.ceil(float(tracked_qpos[0]) - 1e-9)
+    q_max = math.floor(float(tracked_qpos[-1]) + 1e-9)
+    if q_max <= q_min:
+        return beats, round(quarter_per_tracked, 4)
+
+    target_qpos = np.arange(q_min, q_max + 1, dtype=np.float64)
+    resampled = np.interp(target_qpos, tracked_qpos, beats)
+    return resampled, round(quarter_per_tracked, 4)
 
 
 def select_quantization_grid(
@@ -855,7 +902,14 @@ def main() -> None:
     sel_bpm = float(meter_info["bpm_for_meter"])
     first_downbeat = float(meter_info["first_downbeat"])
     quarter_bpm = sel_bpm * (4.0 / sel_btype)
-    beats_per_bar_quarter = max(1, (sel_bpb * 4) // sel_btype)
+    beats_per_bar_quarter = max(1, int(round((sel_bpb * 4) / float(sel_btype))))
+
+    quarter_beats, beat_resample_ratio = resample_beats_to_quarter_pulse(
+        beats=bt_info["beats"],
+        tracked_bpm=float(bt_info["beat_this_bpm"]),
+        quarter_bpm=quarter_bpm,
+        first_downbeat=first_downbeat,
+    )
 
     # Pre-transcription onset-flux grid estimate
     flux_peaks = detect_onset_peak_times(feats["times"], feats["full_flux"])
@@ -893,6 +947,8 @@ def main() -> None:
             "circular_R": bpm_info["circular_R"],
             "max_abs_drift_ms": bpm_info["max_abs_drift_ms"],
             "tempo_mode": bpm_info["tempo_mode"],
+            "beat_resample_ratio": beat_resample_ratio,
+            "quarter_beat_count": int(len(quarter_beats)),
             "grid": grid_info["grid"],
             "grid_pre_transcription": grid_info,
             "bpm_candidates": bpm_info["candidates"],
@@ -918,7 +974,7 @@ def main() -> None:
             quarter_bpm=quarter_bpm,
             beats_per_bar_quarter=beats_per_bar_quarter,
             first_downbeat=first_downbeat,
-            beats_array=bt_info["beats"],
+            beats_array=quarter_beats,
             tempo_mode=bpm_info["tempo_mode"],
             grid_override=args.grid,
             beat_type=sel_btype,
@@ -941,20 +997,24 @@ def main() -> None:
             report["outputs"]["score_musicxml"] = str(xml_path)
 
     final_grid = report["calibration"]["grid"]
+    baseline_xml = out_dir / "score.musicxml"
+    baseline_mid = out_dir / "score.mid"
+    pitch_audit_out = out_dir.parent / "analysis" / "pitch_audit.json"
+    study_xml = out_dir.parent / "score" / "score_learning.musicxml"
+    study_pdf = out_dir.parent / "score" / "score_learning.pdf"
     report["next_commands"] = {
         "stage2_pitch_audit": (
             f'python skills/piano-score-studio/scripts/stage2_pitch_audit.py '
-            f'--audio "{audio_path}" --xml "{out_dir / "score.musicxml"}" '
+            f'--audio "{audio_path}" --xml "{baseline_xml}" '
             f'--bpm {sel_bpm} --beats-per-bar {sel_bpb} --first-downbeat {first_downbeat} '
-            f'--out "{out_dir.parent / "analysis" / "pitch_audit.json"}"'
+            f'--out "{pitch_audit_out}"'
         ),
         "stage3_engrave": (
             f'python skills/piano-score-studio/scripts/stage3_engrave_study_score.py '
-            f'--midi "{out_dir / "score.mid"}" --audio "{audio_path}" '
+            f'--midi "{baseline_mid}" --audio "{audio_path}" '
             f'--bpm {sel_bpm} --beats-per-bar {sel_bpb} --beat-type {sel_btype} '
             f'--grid {final_grid} --first-downbeat {first_downbeat} '
-            f'--out-xml "{out_dir.parent / "score" / "score_learning.musicxml"}" '
-            f'--out-pdf "{out_dir.parent / "score" / "score_learning.pdf"}"'
+            f'--out-xml "{study_xml}" --out-pdf "{study_pdf}"'
         ),
     }
 
