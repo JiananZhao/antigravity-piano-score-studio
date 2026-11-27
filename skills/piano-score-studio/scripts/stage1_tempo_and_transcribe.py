@@ -595,11 +595,14 @@ def select_quantization_grid(
     first_downbeat: float,
     beat_type: int,
     grid_override: int | None,
+    tempo_map: TempoMap | None = None,
 ) -> dict:
     """Pick the coarsest grid (2, 3, or 4 subdivisions per quarter note) covering >= 95% of onsets."""
     allowed = (2, 4) if beat_type == 8 else (2, 3, 4)
     quarter_s = 60.0 / quarter_bpm
     onsets = np.asarray(onset_times, dtype=np.float64)
+    use_rubato = tempo_map is not None and tempo_map.is_rubato and len(onsets) > 0
+    q_onsets = np.array([tempo_map.sec_to_q(float(t)) for t in onsets], dtype=np.float64) if use_rubato else None
 
     coverages: dict[str, float] = {}
     for g in allowed:
@@ -607,9 +610,13 @@ def select_quantization_grid(
             coverages[str(g)] = 100.0
             continue
         step_s = quarter_s / float(g)
-        rel = (onsets - first_downbeat) / step_s
-        dist_s = np.abs(rel - np.round(rel)) * step_s
         tol_s = min(0.22 * step_s, 0.040)
+        if use_rubato and q_onsets is not None:
+            rel = q_onsets * float(g)
+            dist_s = (np.abs(rel - np.round(rel)) / float(g)) * quarter_s
+        else:
+            rel = (onsets - first_downbeat) / step_s
+            dist_s = np.abs(rel - np.round(rel)) * step_s
         coverages[str(g)] = round(float(np.mean(dist_s <= tol_s) * 100.0), 2)
 
     if grid_override is not None:
@@ -954,6 +961,7 @@ def main() -> None:
             "beat_type": sel_btype,
             "first_downbeat": first_downbeat,
             "pickup_sec": meter_info["pickup_sec"],
+            "has_pickup": bool(meter_info["pickup_sec"] > 0.05),
             "circular_R": bpm_info["circular_R"],
             "max_abs_drift_ms": bpm_info["max_abs_drift_ms"],
             "tempo_mode": bpm_info["tempo_mode"],
@@ -993,13 +1001,6 @@ def main() -> None:
                 weight_path=args.model,
             )
             note_onsets = np.asarray([n["start_sec"] for n in tk_notes], dtype=np.float64)
-            grid_refined = select_quantization_grid(
-                onset_times=note_onsets,
-                quarter_bpm=quarter_bpm,
-                first_downbeat=first_downbeat,
-                beat_type=sel_btype,
-                grid_override=args.grid,
-            )
             k0 = int(np.argmin(np.abs(quarter_beats - first_downbeat))) if len(quarter_beats) else 0
             q_arr = (np.arange(len(quarter_beats), dtype=np.float64) - float(k0)) if len(quarter_beats) >= 2 else None
             tmap_s1 = TempoMap(
@@ -1011,7 +1012,15 @@ def main() -> None:
                 q_grid=q_arr,
                 t_grid=quarter_beats if len(quarter_beats) >= 2 else None,
             )
-            quantize_performance_midi(
+            grid_refined = select_quantization_grid(
+                onset_times=note_onsets,
+                quarter_bpm=quarter_bpm,
+                first_downbeat=first_downbeat,
+                beat_type=sel_btype,
+                grid_override=args.grid,
+                tempo_map=tmap_s1,
+            )
+            q_res = quantize_performance_midi(
                 note_events=tk_notes,
                 tempo_map=tmap_s1,
                 grid=int(grid_refined["grid"]),
@@ -1020,6 +1029,7 @@ def main() -> None:
                 out_mid=quant_mid_path,
                 trim_leading_bars=True,
             )
+            report["calibration"]["has_pickup"] = bool(q_res["has_pickup"])
             tr_out = {
                 "note_onset_count": int(len(note_onsets)),
                 "grid_refined": grid_refined,
@@ -1088,7 +1098,6 @@ def main() -> None:
             f'--out-xml "{study_xml}" --out-pdf "{study_pdf}"'
         ),
     }
-
     cal_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
         f"Stage 1 Complete: BPM={sel_bpm} ({sel_bpb}/{sel_btype}), downbeat={first_downbeat:.3f}s, "
