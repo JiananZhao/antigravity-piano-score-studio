@@ -21,6 +21,15 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tempo_map import TempoMap
+from transcription_engines import (
+    quantize_performance_midi,
+    resolve_transcription_engine,
+    run_transkun_transcribe,
+)
+
 
 def find_plugin_root() -> Path:
     # scripts/ -> piano-score-studio/ -> skills/ -> plugin root
@@ -832,7 +841,8 @@ def main() -> None:
     ap.add_argument("--out-dir", required=True, help="Output directory for calibration JSON, score.mid, score.musicxml")
     ap.add_argument("--triage", default=None, help="Optional Stage 0 audio_triage.json (auto-triggers 2s leading silence guard)")
     ap.add_argument("--config", default=None, help="Optional config.json path")
-    ap.add_argument("--model", default=None, help="Optional MuScriptor model path/dir/name (default: config.json muscriptor_model_dir)")
+    ap.add_argument("--engine", default="auto", choices=("auto", "transkun", "muscriptor"), help="Transcription engine (auto prefers MIT TransKun v2, falls back to MuScriptor)")
+    ap.add_argument("--model", default=None, help="Optional model weight path/dir/name (TransKun .pt or MuScriptor model dir)")
     ap.add_argument("--instruments", default="acoustic_piano", help="Comma-separated MuScriptor instrument names (empty/'all' disables filter)")
     ap.add_argument("--device", default="auto", choices=("auto", "cuda", "mps", "cpu"))
     ap.add_argument("--mode", default="auto", choices=("auto", "fixed-tempo", "tempo-map"))
@@ -966,28 +976,79 @@ def main() -> None:
     }
 
     if not args.analyze_only:
-        inst_raw = (args.instruments or "").strip()
-        instruments = None if (not inst_raw or inst_raw.lower() == "all") else [x.strip() for x in inst_raw.split(",") if x.strip()]
-        weights_path = resolve_muscriptor_weights(plugin_root, cfg, args.model)
-        print(
-            f"[Stage 1] Running MuScriptor (weights={weights_path or 'HF default'}, "
-            f"instruments={instruments or 'auto'}, pad={pad_sec:.1f}s, mode={bpm_info['tempo_mode']})..."
-        )
-        tr_out = transcribe_with_muscriptor(
-            audio_path=audio_path,
-            weights_path=weights_path,
-            device=device,
-            instruments=instruments,
-            pad_sec=pad_sec,
-            quarter_bpm=quarter_bpm,
-            beats_per_bar_quarter=beats_per_bar_quarter,
-            first_downbeat=first_downbeat,
-            beats_array=quarter_beats,
-            tempo_mode=bpm_info["tempo_mode"],
-            grid_override=args.grid,
-            beat_type=sel_btype,
-            out_dir=out_dir,
-        )
+        chosen_engine = resolve_transcription_engine(args.engine)
+        report["transcription_engine"] = chosen_engine
+        if chosen_engine == "transkun":
+            print(
+                f"[Stage 1] Running TransKun v2 (MIT, zero-HF-login, device={device}, "
+                f"pad={pad_sec:.1f}s, mode={bpm_info['tempo_mode']})..."
+            )
+            raw_mid_path = out_dir / "score_raw.mid"
+            quant_mid_path = out_dir / "score.mid"
+            tk_notes = run_transkun_transcribe(
+                audio_path=audio_path,
+                out_raw_mid=raw_mid_path,
+                device=device,
+                pad_sec=pad_sec,
+                weight_path=args.model,
+            )
+            note_onsets = np.asarray([n["start_sec"] for n in tk_notes], dtype=np.float64)
+            grid_refined = select_quantization_grid(
+                onset_times=note_onsets,
+                quarter_bpm=quarter_bpm,
+                first_downbeat=first_downbeat,
+                beat_type=sel_btype,
+                grid_override=args.grid,
+            )
+            k0 = int(np.argmin(np.abs(quarter_beats - first_downbeat))) if len(quarter_beats) else 0
+            q_arr = (np.arange(len(quarter_beats), dtype=np.float64) - float(k0)) if len(quarter_beats) >= 2 else None
+            tmap_s1 = TempoMap(
+                bpm=sel_bpm,
+                beats_per_bar=sel_bpb,
+                beat_type=sel_btype,
+                first_downbeat=float(quarter_beats[k0]) if len(quarter_beats) >= 2 else first_downbeat,
+                mode=bpm_info["tempo_mode"],
+                q_grid=q_arr,
+                t_grid=quarter_beats if len(quarter_beats) >= 2 else None,
+            )
+            quantize_performance_midi(
+                note_events=tk_notes,
+                tempo_map=tmap_s1,
+                grid=int(grid_refined["grid"]),
+                beats_per_bar=sel_bpb,
+                beat_type=sel_btype,
+                out_mid=quant_mid_path,
+                trim_leading_bars=True,
+            )
+            tr_out = {
+                "note_onset_count": int(len(note_onsets)),
+                "grid_refined": grid_refined,
+                "raw_midi": str(raw_mid_path),
+                "quantized_midi": str(quant_mid_path),
+            }
+        else:
+            inst_raw = (args.instruments or "").strip()
+            instruments = None if (not inst_raw or inst_raw.lower() == "all") else [x.strip() for x in inst_raw.split(",") if x.strip()]
+            weights_path = resolve_muscriptor_weights(plugin_root, cfg, args.model)
+            print(
+                f"[Stage 1] Running MuScriptor (weights={weights_path or 'HF default'}, "
+                f"instruments={instruments or 'auto'}, pad={pad_sec:.1f}s, mode={bpm_info['tempo_mode']})..."
+            )
+            tr_out = transcribe_with_muscriptor(
+                audio_path=audio_path,
+                weights_path=weights_path,
+                device=device,
+                instruments=instruments,
+                pad_sec=pad_sec,
+                quarter_bpm=quarter_bpm,
+                beats_per_bar_quarter=beats_per_bar_quarter,
+                first_downbeat=first_downbeat,
+                beats_array=quarter_beats,
+                tempo_mode=bpm_info["tempo_mode"],
+                grid_override=args.grid,
+                beat_type=sel_btype,
+                out_dir=out_dir,
+            )
         report["calibration"]["grid"] = tr_out["grid_refined"]["grid"]
         report["calibration"]["grid_post_transcription"] = tr_out["grid_refined"]
         report["calibration"]["transcribed_note_onsets"] = tr_out["note_onset_count"]
