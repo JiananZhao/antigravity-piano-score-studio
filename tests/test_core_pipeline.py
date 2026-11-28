@@ -1001,3 +1001,26 @@ def test_stage4_sustain_restoration_and_acoustic_chord_voicing() -> None:
     assert adj == 1
     assert chord_notes[0]["calc_vel"] == 77
     assert chord_notes[1]["calc_vel"] <= 16
+
+
+def test_stage4_export_mp3_from_wav_graceful_skip_and_real(tmp_path: Path, monkeypatch) -> None:
+    """export_mp3_from_wav returns None gracefully without ffmpeg and writes valid MP3 when available."""
+    import shutil
+    s4 = _load_script("stage4_render_calibrated.py")
+
+    wav_p = tmp_path / "demo.wav"
+    mp3_p = tmp_path / "demo.mp3"
+    sr = 16000
+    t = np.arange(sr // 2) / sr
+    sf.write(str(wav_p), 0.2 * np.sin(2.0 * np.pi * 440.0 * t), sr, subtype="PCM_16")
+
+    # 1. Missing ffmpeg -> graceful None (never crashes)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    assert s4.export_mp3_from_wav(wav_p, mp3_p) is None
+    assert not mp3_p.exists()
+
+    # 2. Real ffmpeg (if installed on CI/host) -> creates non-empty MP3
+    monkeypatch.undo()
+    if shutil.which("ffmpeg"):
+        res = s4.export_mp3_from_wav(wav_p, mp3_p)
+        assert res == mp3_p and mp3_p.is_file() and mp3_p.stat().st_size > 1000

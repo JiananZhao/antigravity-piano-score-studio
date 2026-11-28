@@ -439,6 +439,9 @@ def main() -> None:
         _run_step("Stage 4: Calibrated Salamander Render", s4_cmd)
         manifest["artifacts"]["calibrated_mid"] = str(cal_mid)
         manifest["artifacts"]["calibrated_wav"] = str(cal_wav)
+        cal_mp3 = deliverables_dir / f"{song_name}_Full_Calibrated_Salamander.mp3"
+        if cal_mp3.is_file():
+            manifest["artifacts"]["calibrated_mp3"] = str(cal_mp3)
         set_stage_status(manifest, "stage4_render_audio", "done")
         save_manifest(manifest_path, manifest)
 
