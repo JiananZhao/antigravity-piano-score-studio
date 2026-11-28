@@ -434,6 +434,8 @@ def main() -> None:
             "--out-dir",
             str(deliverables_dir),
         ]
+        if pitch_audit_json.is_file():
+            s4_cmd.extend(["--pitch-audit", str(pitch_audit_json)])
         if args.config:
             s4_cmd.extend(["--config", args.config])
         _run_step("Stage 4: Calibrated Salamander Render", s4_cmd)

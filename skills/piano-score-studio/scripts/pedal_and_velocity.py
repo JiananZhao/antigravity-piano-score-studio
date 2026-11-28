@@ -234,7 +234,7 @@ def align_microtiming_to_transkun(
     notes: Sequence[dict],
     source_events: Sequence[tuple],
     blend: float = 0.80,
-    max_shift_sec: float = 0.14,
+    max_shift_sec: float = 0.22,
 ) -> int:
     """Shift rendered note onsets (and restore real sustain durations when 4-tuples are given)
     toward TransKun performance timing.
@@ -366,3 +366,260 @@ def calibrate_chord_voicing_from_audio(
                         x["voicing_calibrated"] = True
                         adjusted += 1
     return adjusted
+
+
+def load_confirmed_ghosts_from_audit(pitch_audit_path: Path | None) -> list[tuple[float, int]]:
+    """Return `(t_on, midi_pitch)` pairs marked `CONFIRMED_GHOST` in Stage 2 pitch_audit.json."""
+    if pitch_audit_path is None or not pitch_audit_path.is_file():
+        return []
+    import json
+
+    try:
+        data = json.loads(pitch_audit_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    ghosts: list[tuple[float, int]] = []
+    for item in data.get("minor2nd_clashes", []):
+        if item.get("verdict") == "CONFIRMED_GHOST":
+            try:
+                ghosts.append((float(item["t_on"]), int(item["weaker_midi"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return ghosts
+
+
+def build_performance_notes_from_raw_midi(
+    raw_events: Sequence[tuple[float, float, int, int]],
+    xml_notes: Sequence[dict],
+    tempo_map=None,
+    confirmed_ghosts: Sequence[tuple[float, int]] = (),
+    split_pitch: int = 60,
+    max_bar: int = 1,
+) -> tuple[list[dict], int]:
+    """Build Stage 4 performance notes directly from raw TransKun MIDI (`score_raw.mid`).
+
+    Decouples audio/performance MIDI rendering from Study Score quantization so rubato
+    arpeggios and finger-hold durations never suffer grid-snapping collisions or truncation.
+    Borrows only `staff` (RH/LH) and `measure` metadata from `xml_notes` without altering
+    `st`, `et`, or `calc_vel`.
+
+    Returns `(perf_notes, removed_ghost_count)`.
+    """
+    if not raw_events:
+        return [], 0
+
+    # 1. Remove Stage 2 confirmed ghost notes (1-to-1 closest match within 0.18s)
+    kept: list[tuple[float, float, int, int]] = list(raw_events)
+    removed_ghosts = 0
+    for g_time, g_pitch in confirmed_ghosts:
+        best_idx = -1
+        best_err = 0.181
+        for idx, (st_s, _, p_s, _) in enumerate(kept):
+            if int(p_s) != int(g_pitch):
+                continue
+            err = abs(float(st_s) - float(g_time))
+            if err < best_err:
+                best_err = err
+                best_idx = idx
+        if best_idx >= 0:
+            kept.pop(best_idx)
+            removed_ghosts += 1
+
+    # 2. Index XML notes by pitch solely to borrow engraved staff & measure labels
+    xml_by_pitch: dict[int, list[list]] = {}
+    for xn in xml_notes:
+        xml_by_pitch.setdefault(int(xn["pitch"]), []).append(
+            [float(xn["st"]), int(xn.get("staff", 1)), int(xn.get("measure", 1)), False]
+        )
+
+    bar_bounds: list[tuple[int, float, float]] = []
+    if tempo_map is not None:
+        for m in range(0, max(1, max_bar) + 1):
+            try:
+                t0, t1 = tempo_map.bar_bounds_sec(m)
+                bar_bounds.append((m, float(t0), float(t1)))
+            except Exception:
+                break
+
+    def _infer_measure(t_sec: float) -> int:
+        for m, t0, t1 in bar_bounds:
+            if t0 - 0.05 <= t_sec < t1:
+                return m
+        return bar_bounds[-1][0] if bar_bounds and t_sec >= bar_bounds[-1][1] else 1
+
+    perf_notes: list[dict] = []
+    for st_s, et_s, pitch, vel in kept:
+        p = int(pitch)
+        st = max(0.0, float(st_s))
+        et = max(st + 0.05, float(et_s))
+        staff = 1 if p >= split_pitch else 2
+        measure = _infer_measure(st)
+
+        cands = xml_by_pitch.get(p)
+        if cands:
+            best_i = -1
+            best_err = 0.28
+            for idx, item in enumerate(cands):
+                if item[3]:
+                    continue
+                err = abs(item[0] - st)
+                if err < best_err:
+                    best_err = err
+                    best_i = idx
+            if best_i >= 0:
+                cands[best_i][3] = True
+                staff = cands[best_i][1]
+                measure = cands[best_i][2]
+
+        perf_notes.append(
+            {
+                "measure": measure,
+                "st": st,
+                "et": et,
+                "pitch": p,
+                "staff": staff,
+                "arpeggiate": False,
+                "calc_vel": int(np.clip(int(vel), 10, 118)),
+                "timing_aligned_transkun": True,
+                "vel_fused_transkun": True,
+                "source_raw_midi": True,
+            }
+        )
+
+    # Prevent same-pitch overlaps cleanly without truncating real sustains
+    same_pitch: dict[int, list[dict]] = {}
+    for n in perf_notes:
+        same_pitch.setdefault(int(n["pitch"]), []).append(n)
+    for grp in same_pitch.values():
+        grp.sort(key=lambda x: x["st"])
+        for i in range(len(grp) - 1):
+            nxt_st = float(grp[i + 1]["st"])
+            if float(grp[i]["et"]) > nxt_st - 0.012:
+                grp[i]["et"] = max(float(grp[i]["st"]) + 0.04, nxt_st - 0.012)
+
+    perf_notes.sort(key=lambda x: (x["st"], x["staff"], x["pitch"]))
+    return perf_notes, removed_ghosts
+
+
+def closed_loop_velocity_calibration(
+    notes: Sequence[dict],
+    mono_orig: np.ndarray,
+    sr_orig: int,
+    mono_rend: np.ndarray,
+    sr_rend: int,
+    deadband_db: float = 2.0,
+    damping: float = 0.72,
+    max_corr_db: float = 12.0,
+    vel_db_per_decade: float = 30.0,
+    cluster_sec: float = 0.030,
+) -> tuple[int, float]:
+    """Closed-loop Render-Measure-Correct per-note velocity calibration.
+
+    Compares actual Pass-1 rendered audio (`mono_rend`) against original audio (`mono_orig`)
+    at every note onset (grouped into simultaneous chord windows for fast vectorized FFT).
+    Compensates directly for soundfont per-pitch / per-velocity-layer loudness differences
+    (e.g. Salamander Grand Piano F5 sounding brighter/louder than D5 at equal MIDI velocity).
+
+    Returns `(adjusted_note_count, median_abs_error_db)`.
+    """
+    if not notes or len(mono_orig) < 512 or len(mono_rend) < 512:
+        return 0, 0.0
+
+    # Global active-region RMS offset so we calibrate relative voicing, never global gain
+    t_first = max(0.0, min(float(n["st"]) for n in notes))
+    t_last = min(
+        len(mono_orig) / float(sr_orig),
+        len(mono_rend) / float(sr_rend),
+        max(float(n["et"]) for n in notes) + 0.5,
+    )
+    if t_last <= t_first + 0.2:
+        return 0, 0.0
+
+    o_seg = mono_orig[int(t_first * sr_orig) : int(t_last * sr_orig)]
+    r_seg = mono_rend[int(t_first * sr_rend) : int(t_last * sr_rend)]
+    rms_o = float(np.sqrt(np.mean(o_seg ** 2))) if len(o_seg) else 0.0
+    rms_r = float(np.sqrt(np.mean(r_seg ** 2))) if len(r_seg) else 0.0
+    if rms_o < 1e-6 or rms_r < 1e-6:
+        return 0, 0.0
+    global_diff_db = 20.0 * np.log10(rms_r / rms_o)
+
+    n_fft = 16384
+    fs_o = np.fft.rfftfreq(n_fft, 1.0 / sr_orig)
+    fs_r = np.fft.rfftfreq(n_fft, 1.0 / sr_rend)
+
+    def _spec_at(sig: np.ndarray, sr: int, t0: float, dur: float) -> np.ndarray | None:
+        i0 = max(0, int(round(t0 * sr)))
+        i1 = min(len(sig), int(round((t0 + dur) * sr)))
+        seg = sig[i0:i1]
+        if len(seg) < 128:
+            return None
+        w = np.hanning(len(seg))
+        w_sum = float(np.sum(w)) * 0.5 + 1e-12
+        return (np.abs(np.fft.rfft(seg * w, n=n_fft)) / w_sum) ** 2
+
+    def _pitch_db(power_spec: np.ndarray, fs: np.ndarray, sr: int, pitch: int, chord_pitches: set[int]) -> float:
+        f0 = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+        # Mid/upper register: fundamental-dominated (avoids bass harmonic bleed);
+        # Bass register (<52): include H1+H2+H3 because low piano strings radiate mostly via H2/H3.
+        if pitch >= 52:
+            harm_weights = ((1, 1.0),) if (pitch + 12) in chord_pitches else ((1, 1.0), (2, 0.35))
+        else:
+            harm_weights = ((1, 1.0), (2, 1.0), (3, 0.75))
+        tot = 0.0
+        for h, w_h in harm_weights:
+            ft = f0 * h
+            if ft >= sr * 0.48:
+                continue
+            bw = max(ft * 0.015, 2.5)
+            m = (fs >= ft - bw) & (fs <= ft + bw)
+            if np.any(m):
+                tot += w_h * float(np.max(power_spec[m]))
+        return 10.0 * float(np.log10(max(tot, 1e-12)))
+
+    # Group simultaneous notes into chord windows to reuse FFTs cleanly
+    ordered = sorted(notes, key=lambda x: (float(x["st"]), int(x["pitch"])))
+    clusters: list[list[dict]] = []
+    for n in ordered:
+        if not clusters or (float(n["st"]) - float(clusters[-1][0]["st"])) > cluster_sec:
+            clusters.append([n])
+        else:
+            clusters[-1].append(n)
+
+    adjusted = 0
+    abs_errs: list[float] = []
+    for cl in clusters:
+        t_win = min(float(x["st"]) for x in cl)
+        sp_o = _spec_at(mono_orig, sr_orig, t_win + 0.010, 0.165)
+        sp_r = _spec_at(mono_rend, sr_rend, t_win + 0.010, 0.165)
+        if sp_o is None or sp_r is None:
+            continue
+        sp_o_pre = _spec_at(mono_orig, sr_orig, max(0.0, t_win - 0.090), 0.075)
+        chord_pitches = {int(x["pitch"]) for x in cl}
+
+        for n in cl:
+            p = int(n["pitch"])
+            orig_db = _pitch_db(sp_o, fs_o, sr_orig, p, chord_pitches)
+            rend_db = _pitch_db(sp_r, fs_r, sr_rend, p, chord_pitches)
+            if max(orig_db, rend_db) < -55.0:
+                continue
+            # Skip if the exact same pitch was already ringing much louder right before onset
+            if sp_o_pre is not None:
+                pre_db = _pitch_db(sp_o_pre, fs_o, sr_orig, p, chord_pitches)
+                if pre_db > orig_db + 4.0 and pre_db > -45.0:
+                    continue
+
+            err_db = (rend_db - orig_db) - global_diff_db
+            abs_errs.append(abs(err_db))
+            if abs(err_db) <= deadband_db:
+                continue
+
+            corr_db = float(np.clip(damping * err_db, -max_corr_db, max_corr_db))
+            cur_v = int(n.get("calc_vel", 64))
+            new_v = int(np.clip(round(cur_v * (10.0 ** (-corr_db / vel_db_per_decade))), 10, 118))
+            if new_v != cur_v:
+                n["calc_vel"] = new_v
+                n["closed_loop_calibrated"] = True
+                adjusted += 1
+
+    med_err = float(np.median(abs_errs)) if abs_errs else 0.0
+    return adjusted, med_err
