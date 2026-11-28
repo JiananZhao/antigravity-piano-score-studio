@@ -405,6 +405,30 @@ def apply_natural_hall_reverb(
     return dry_gain * sig + wet_mix * wet
 
 
+def export_mp3_from_wav(wav_path: Path, mp3_path: Path, bitrate: str = "320k") -> Path | None:
+    """Convert rendered WAV deliverable to high-quality MP3 via ffmpeg when available."""
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe or not wav_path.is_file():
+        return None
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", str(wav_path),
+        "-codec:a", "libmp3lame",
+        "-b:a", bitrate,
+        str(mp3_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        print(f"[WARN] ffmpeg MP3 export timed out for {wav_path.name}; skipping MP3.")
+        return None
+    if proc.returncode == 0 and mp3_path.is_file() and mp3_path.stat().st_size > 0:
+        return mp3_path
+    print(f"[WARN] ffmpeg MP3 export failed (code={proc.returncode}); keeping WAV deliverable only.")
+    return None
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -593,8 +617,10 @@ def main() -> None:
         final_sig *= ceil / peak
 
     full_wav = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.wav"
+    full_mp3 = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.mp3"
     prev_wav = out_dir / f"{args.song_name}_Bars0_20_Preview_Salamander.wav"
     sf.write(str(full_wav), final_sig, sr, subtype="PCM_24")
+    mp3_out = export_mp3_from_wav(full_wav, full_mp3)
 
     _, b20_t_end = tmap.bar_bounds_sec(min(20, max_bar))
     b20_end = int((b20_t_end + 2.5) * sr)
@@ -602,7 +628,8 @@ def main() -> None:
     fl = min(len(pv), int(1.5 * sr))
     pv[-fl:] *= np.linspace(1.0, 0.0, fl)[:, None]
     sf.write(str(prev_wav), pv, sr, subtype="PCM_24")
-    print(f"Stage 4 Render Complete: {full_wav.name}, {prev_wav.name}, {mid_out.name}")
+    mp3_note = f", {mp3_out.name}" if mp3_out else ""
+    print(f"Stage 4 Render Complete: {full_wav.name}{mp3_note}, {prev_wav.name}, {mid_out.name}")
 
 
 if __name__ == "__main__":
