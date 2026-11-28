@@ -22,6 +22,36 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def detect_first_note_sec(mono: np.ndarray, sr: int) -> float:
+    """Detect first active note onset (sec) using an adaptive relative threshold (P0-1).
+
+    Uses thr = max(peak_db - 30.0, noise_floor_db + 12.0), where noise_floor_db is
+    the 10th-percentile 10 ms frame RMS. Falls back to 0.0 on near-silent tracks or
+    when the detected onset falls past 90% of track duration.
+    """
+    hop_10ms = max(1, int(round(sr * 0.01)))
+    nf = len(mono) // hop_10ms
+    dur_s = float(len(mono) / max(1, sr))
+    if nf <= 0:
+        return 0.0
+    frames = mono[: nf * hop_10ms].reshape(nf, hop_10ms)
+    rms_db = 10.0 * np.log10(np.mean(frames ** 2, axis=1) + 1e-15)
+    peak_db = float(np.max(rms_db))
+    if peak_db < -80.0:
+        return 0.0
+    noise_floor_db = float(np.percentile(rms_db, 10))
+    thr_db = max(peak_db - 30.0, noise_floor_db + 12.0)
+    if thr_db >= peak_db:
+        thr_db = peak_db - 6.0
+    above = np.where(rms_db > thr_db)[0]
+    if len(above) == 0:
+        return 0.0
+    first_sec = float(above[0] * 0.01)
+    if dur_s > 0.0 and first_sec >= 0.9 * dur_s:
+        return 0.0
+    return first_sec
+
+
 def analyze_audio(path: Path) -> dict:
     try:
         info = sf.info(str(path))
@@ -51,11 +81,8 @@ def analyze_audio(path: Path) -> dict:
         fdb = 10.0 * np.log10(np.mean(seg[: nf * hop_10ms].reshape(nf, hop_10ms) ** 2, axis=1) + 1e-15)
         dropouts = int(np.sum(fdb < -70.0))
 
-    # First active note (> -35 dBFS in mono 10ms frames)
-    nf_all = n_frames // hop_10ms
-    mdb = 10.0 * np.log10(np.mean(mono[: nf_all * hop_10ms].reshape(nf_all, hop_10ms) ** 2, axis=1) + 1e-15)
-    above = np.where(mdb > -35.0)[0]
-    first_note_sec = float(above[0] * 0.01) if len(above) else dur_s
+    # First active note using adaptive relative threshold (P0-1)
+    first_note_sec = detect_first_note_sec(mono, sr)
 
     # Stereo coherence & mono-sum cancellation
     lr_corr = 1.0

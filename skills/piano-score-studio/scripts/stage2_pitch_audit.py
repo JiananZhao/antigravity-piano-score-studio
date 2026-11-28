@@ -105,6 +105,7 @@ def parse_midi_onsets(
     beat_type: int = 4,
     tempo_map: TempoMap | None = None,
     has_pickup: bool = False,
+    bar1_offset_quarters: float | None = None,
 ) -> list[dict]:
     """Parse note onsets directly from quantized score MIDI + TempoMap (P1-5).
 
@@ -117,7 +118,7 @@ def parse_midi_onsets(
     tpb = max(1, int(mid.ticks_per_beat))
     beat_quarters = 4.0 / float(beat_type)
     bar_quarters = float(beats_per_bar) * beat_quarters
-    pickup_offset_q = bar_quarters if has_pickup else 0.0
+    pickup_offset_q = float(bar1_offset_quarters) if bar1_offset_quarters is not None else (bar_quarters if has_pickup else 0.0)
     q_sec = 60.0 / float(bpm)
 
     out: list[dict] = []
@@ -189,6 +190,61 @@ def harmonic_evidence(mono: np.ndarray, sr: int, t_on: float, midi: int) -> dict
     }
 
 
+def match_raw_onset_times(
+    notes: list[dict],
+    raw_midi_path: Path,
+    max_shift_sec: float = 0.25,
+) -> int:
+    """Attach nearest raw performance onset time (`t_eval`) to quantized notes (P1-3)."""
+    import mido
+
+    mid = mido.MidiFile(str(raw_midi_path))
+    tpb = max(1, int(mid.ticks_per_beat))
+    tempo_events: list[tuple[int, int]] = []
+    for tr in mid.tracks:
+        tk = 0
+        for msg in tr:
+            tk += msg.time
+            if msg.type == "set_tempo":
+                tempo_events.append((tk, int(msg.tempo)))
+    tempo_events.sort(key=lambda x: x[0])
+
+    def tick_to_sec(target_tick: int) -> float:
+        sec = 0.0
+        cur_tk = 0
+        cur_tempo = 500_000
+        for t_tk, tmp in tempo_events:
+            if t_tk >= target_tick:
+                break
+            if t_tk > cur_tk:
+                sec += mido.tick2second(t_tk - cur_tk, tpb, cur_tempo)
+                cur_tk = t_tk
+            cur_tempo = tmp
+        if target_tick > cur_tk:
+            sec += mido.tick2second(target_tick - cur_tk, tpb, cur_tempo)
+        return sec
+
+    raw_by_pitch: dict[int, list[float]] = {}
+    for tr in mid.tracks:
+        tk = 0
+        for msg in tr:
+            tk += msg.time
+            if msg.type == "note_on" and msg.velocity > 0:
+                raw_by_pitch.setdefault(int(msg.note), []).append(tick_to_sec(tk))
+
+    matched = 0
+    for n in notes:
+        cands = raw_by_pitch.get(int(n["midi"]))
+        if not cands:
+            continue
+        t_q = float(n["t_on"])
+        best_t = min(cands, key=lambda t_r: abs(t_r - t_q))
+        if abs(best_t - t_q) <= max_shift_sec:
+            n["t_eval"] = float(best_t)
+            matched += 1
+    return matched
+
+
 def clean_ghost_notes_from_midi(
     in_midi: Path,
     out_midi: Path,
@@ -196,6 +252,7 @@ def clean_ghost_notes_from_midi(
     tol_sec: float = 0.08,
     tempo_map: TempoMap | None = None,
     has_pickup: bool = False,
+    bar1_offset_quarters: float | None = None,
 ) -> int:
     """Remove confirmed ghost notes (matched by pitch + onset time) from a MIDI file."""
     import mido
@@ -243,7 +300,8 @@ def clean_ghost_notes_from_midi(
             drop = False
             if msg.type == "note_on" and msg.velocity > 0:
                 if tempo_map is not None:
-                    q_rel = (abs_tick / float(tpb)) - (tempo_map.bar_quarters if has_pickup else 0.0)
+                    eff_off_q = float(bar1_offset_quarters) if bar1_offset_quarters is not None else (tempo_map.bar_quarters if has_pickup else 0.0)
+                    q_rel = (abs_tick / float(tpb)) - eff_off_q
                     t_sec = tempo_map.q_to_sec(q_rel)
                 else:
                     t_sec = tick_to_sec(abs_tick)
@@ -293,6 +351,7 @@ def main() -> None:
     ap.add_argument("--first-downbeat", type=float, required=True)
     ap.add_argument("--stage1-cal", default=None, help="Optional Stage 1 stage1_calibration.json for rubato tempo-map alignment")
     ap.add_argument("--midi", default=None, help="Optional input MIDI path (required when using --clean-midi)")
+    ap.add_argument("--raw-midi", default=None, help="Optional unquantized score_raw.mid for real-onset harmonic evidence (P1-3)")
     ap.add_argument("--clean-midi", default=None, help="Optional output path to write MIDI with confirmed ghost notes removed")
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID (e.g. jazz_groove)")
     ap.add_argument("--key-fifths", type=int, default=None, help="Optional key signature fifths (-7..+7) for diatonic scale check")
@@ -324,6 +383,8 @@ def main() -> None:
     else:
         has_pickup = False
 
+    b1_off_raw = cal_section.get("bar1_offset_quarters")
+    bar1_offset_quarters = float(b1_off_raw) if b1_off_raw is not None else None
     tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, eff_bt, args.first_downbeat)
     if args.midi and Path(args.midi).is_file() and not args.prefer_xml:
         onset_source = "midi"
@@ -335,6 +396,7 @@ def main() -> None:
             beat_type=eff_bt,
             tempo_map=tmap,
             has_pickup=has_pickup,
+            bar1_offset_quarters=bar1_offset_quarters,
         )
     else:
         if not args.xml:
@@ -354,10 +416,14 @@ def main() -> None:
         pcs = np.bincount([n["midi"] % 12 for n in notes], minlength=12)
         scale_pcs = set(np.argsort(pcs)[-7:].tolist())
 
+    raw_onset_matched = 0
+    if args.raw_midi and Path(args.raw_midi).is_file():
+        raw_onset_matched = match_raw_onset_times(notes, Path(args.raw_midi))
+
     # Group by quantized 40ms onset buckets to detect minor-2nd clashes
     by_bucket: dict[int, list[dict]] = {}
     for n in notes:
-        ev = harmonic_evidence(mono, sr, n["t_on"], n["midi"])
+        ev = harmonic_evidence(mono, sr, n.get("t_eval", n["t_on"]), n["midi"])
         n.update(ev)
         by_bucket.setdefault(int(round(n["t_on"] / 0.04)), []).append(n)
 
@@ -398,7 +464,12 @@ def main() -> None:
             raise ValueError("--clean-midi requires --midi <input.mid>")
         # has_pickup already resolved above from stage1_calibration.json or XML
         removed_ghosts = clean_ghost_notes_from_midi(
-            Path(args.midi), Path(args.clean_midi), confirmed_ghosts, tempo_map=tmap, has_pickup=has_pickup
+            Path(args.midi),
+            Path(args.clean_midi),
+            confirmed_ghosts,
+            tempo_map=tmap,
+            has_pickup=has_pickup,
+            bar1_offset_quarters=bar1_offset_quarters,
         )
         cleaned_midi_str = str(Path(args.clean_midi))
     remaining_ghosts = max(0, len(confirmed_ghosts) - removed_ghosts)
@@ -406,6 +477,7 @@ def main() -> None:
     report = {
         "stage": "stage_2_transcription_pitch_audit",
         "onset_source": onset_source,
+        "raw_onset_matched": raw_onset_matched,
         "style_profile": (profile or {}).get("profile_id", "default"),
         "thresholds": {"ghost_f0_gap_db": ghost_f0_gap_db, "ghost_og_db": ghost_og_db, "weak_oos_snr_db": weak_oos_snr_db},
         "total_onsets": len(notes),
