@@ -1,6 +1,6 @@
 """Stage 4.2-4.4: Generalized two-band LH/RH velocity calibration, CC64 pedaling,
 Salamander Grand Piano rendering (sfizz_render CLI or music-learning NativeHost),
-and transparent loudness-aligned mastering.
+natural stereo concert-hall reverb, and transparent loudness-aligned mastering.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
 from tempo_map import TempoMap, load_tempo_map
 from style_analyzer import load_style_profile
 from pedal_and_velocity import (
+    align_microtiming_to_transkun,
     compute_dynamic_pedal_events,
     fuse_transkun_velocities,
     read_midi_pedal_events,
@@ -323,6 +324,83 @@ def render_with_sfizz_or_native(
     raise RuntimeError("Neither sfizz_render nor music-learning NativeHost is available. Check setup_assets.py --check")
 
 
+def apply_natural_hall_reverb(
+    sig: np.ndarray,
+    sr: int,
+    wet_mix: float = 0.18,
+    rt60_sec: float = 2.0,
+) -> np.ndarray:
+    """Apply warm, non-metallic stereo concert-hall reverb via pure NumPy FFT convolution.
+
+    Uses decorrelated stereo early reflections + frequency-damped diffuse tail (highs decay
+    faster than lows, wet bass high-passed at 120 Hz to keep low piano registers clean).
+    """
+    sig = np.asarray(sig, dtype=np.float64)
+    if sig.ndim == 1:
+        sig = np.column_stack([sig, sig])
+    if wet_mix <= 0.0 or len(sig) == 0:
+        return sig
+
+    ir_len = int(round(max(0.5, rt60_sec * 1.15) * sr))
+    t = np.arange(ir_len, dtype=np.float64) / float(sr)
+    rng = np.random.default_rng(202604)
+
+    # Frequency-dependent exponential decay envelopes (RT60: -60 dB => exp(-6.9078 * t / rt60))
+    tau_lo = max(0.15, rt60_sec / 6.9078)
+    tau_hi = max(0.08, (rt60_sec * 0.42) / 6.9078)
+    pre_s = int(round(0.018 * sr))
+    fade_s = max(1, int(round(0.025 * sr)))
+    gate = np.zeros(ir_len, dtype=np.float64)
+    if pre_s < ir_len:
+        gate[pre_s:] = 1.0
+        f_end = min(ir_len, pre_s + fade_s)
+        gate[pre_s:f_end] = np.linspace(0.0, 1.0, f_end - pre_s)
+
+    env_lo = gate * np.exp(-np.maximum(0.0, t - 0.018) / tau_lo)
+    env_hi = gate * np.exp(-np.maximum(0.0, t - 0.018) / tau_hi)
+
+    freqs = np.fft.rfftfreq(ir_len, 1.0 / sr)
+    hp_mask = np.clip((freqs - 90.0) / 80.0, 0.0, 1.0)
+    lp_mask = 1.0 / (1.0 + (freqs / 2600.0) ** 2)
+    hi_mask = (1.0 - lp_mask) * (1.0 / (1.0 + (freqs / 7500.0) ** 2))
+
+    # Subtle stereo early reflections (14..62 ms)
+    early_taps = (
+        (0.014, 0.42, 0.25),
+        (0.023, 0.22, 0.36),
+        (0.034, 0.30, 0.18),
+        (0.047, 0.15, 0.26),
+        (0.061, 0.20, 0.14),
+    )
+
+    ir = np.zeros((ir_len, 2), dtype=np.float64)
+    for ch in range(2):
+        noise = rng.standard_normal(ir_len)
+        sp = np.fft.rfft(noise)
+        lo_tail = np.fft.irfft(sp * hp_mask * lp_mask, n=ir_len) * env_lo
+        hi_tail = np.fft.irfft(sp * hp_mask * hi_mask, n=ir_len) * env_hi
+        chan_ir = lo_tail + 0.55 * hi_tail
+        for tap_t, g_l, g_r in early_taps:
+            idx = int(round(tap_t * sr))
+            if idx < ir_len:
+                chan_ir[idx] += g_l if ch == 0 else g_r
+        norm = float(np.sqrt(np.sum(chan_ir ** 2))) + 1e-12
+        ir[:, ch] = chan_ir / norm
+
+    n_out = len(sig)
+    n_fft = 1 << (n_out + ir_len - 1).bit_length()
+    wet = np.zeros_like(sig)
+    for ch in range(2):
+        conv = np.fft.irfft(
+            np.fft.rfft(sig[:, ch], n=n_fft) * np.fft.rfft(ir[:, ch], n=n_fft),
+            n=n_fft,
+        )
+        wet[:, ch] = conv[:n_out]
+
+    dry_gain = float(np.sqrt(max(0.0, 1.0 - wet_mix * wet_mix)))
+    return dry_gain * sig + wet_mix * wet
+
+
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -421,9 +499,12 @@ def main() -> None:
 
     if args.transkun_midi and Path(args.transkun_midi).is_file():
         src_vels = read_midi_velocity_events(Path(args.transkun_midi))
-        fused_cnt = fuse_transkun_velocities(notes, src_vels, alpha=0.55, lh_ceiling_vel=lh_ceiling_vel)
+        fused_cnt = fuse_transkun_velocities(notes, src_vels, alpha=0.92, lh_ceiling_vel=lh_ceiling_vel)
         if fused_cnt > 0:
-            print(f"Stage 4 TransKun velocity fusion applied to {fused_cnt}/{len(notes)} notes (lh_ceiling={lh_ceiling_vel})")
+            print(f"Stage 4 TransKun velocity fusion applied to {fused_cnt}/{len(notes)} notes (alpha=0.92, lh_ceiling={lh_ceiling_vel})")
+        aligned_cnt = align_microtiming_to_transkun(notes, src_vels, blend=0.80, max_shift_sec=0.10)
+        if aligned_cnt > 0:
+            print(f"Stage 4 TransKun micro-timing alignment applied to {aligned_cnt}/{len(notes)} notes")
 
     # Round 1 static dynamics check
     rh_med = float(np.median([n["calc_vel"] for n in rh_all])) if rh_all else 0.0
@@ -447,7 +528,9 @@ def main() -> None:
             clusters[-1].append(n)
     for cl in clusters:
         cl.sort(key=lambda x: x["pitch"])
-        step = 0.018 if (len(cl) > 1 and any(x["arpeggiate"] for x in cl)) else 0.008
+        has_arp = len(cl) > 1 and any(x["arpeggiate"] for x in cl)
+        all_human_timed = all(x.get("timing_aligned_transkun") for x in cl)
+        step = 0.018 if has_arp else (0.0 if all_human_timed else 0.008)
         for idx, n in enumerate(cl):
             st = n["st"] + (idx * step if len(cl) > 1 else 0.0)
             dur = max(0.14, n["et"] - st) * (0.98 if n["staff"] == 1 else 1.0)
@@ -484,11 +567,10 @@ def main() -> None:
         sig, sr = sf.read(str(raw_wav))
 
     # Preserve natural Salamander Grand Piano timbre & dynamics:
-    # Apply only transparent whole-song RMS loudness alignment + -1.0 dBFS peak ceiling
-    # (no hard-coded EQ colorization and no 30ms envelope pumping).
-    final_sig = np.asarray(sig, dtype=np.float64)
-    if final_sig.ndim == 1:
-        final_sig = np.column_stack([final_sig, final_sig])
+    # Add gentle stereo concert-hall reverb + transparent whole-song RMS loudness alignment
+    # + -1.0 dBFS peak ceiling (no hard-coded EQ colorization and no 30ms envelope pumping).
+    reverb_wet = 0.06 if pedal_style == "dry_articulated" else 0.18
+    final_sig = apply_natural_hall_reverb(sig, sr, wet_mix=reverb_wet, rt60_sec=2.0)
     n_smp = len(final_sig)
     dar = min(n_smp, max(1, int(t_end * sr)))
     rms_cur = float(np.sqrt(np.mean(final_sig[:dar] ** 2)))

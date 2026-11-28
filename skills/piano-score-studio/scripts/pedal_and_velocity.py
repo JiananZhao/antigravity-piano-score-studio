@@ -207,7 +207,52 @@ def fuse_transkun_velocities(
             blended = alpha * float(best_vel) + (1.0 - alpha) * base_v
             if int(n.get("staff", 1)) == 2:
                 blended = min(blended, float(lh_ceiling_vel))
-            n["calc_vel"] = int(np.clip(round(blended), 24, 118))
+            n["calc_vel"] = int(np.clip(round(blended), 12, 118))
             n["vel_fused_transkun"] = True
             fused += 1
     return fused
+
+
+def align_microtiming_to_transkun(
+    notes: Sequence[dict],
+    source_vel_events: Sequence[tuple[float, int, int]],
+    blend: float = 0.80,
+    max_shift_sec: float = 0.10,
+) -> int:
+    """Gently shift rendered note onsets toward TransKun performance micro-timing.
+
+    Keeps the MusicXML score cleanly quantized while restoring natural human phrasing,
+    subtle chord rolls, and rubato breathing in the rendered audio.
+    """
+    if not notes or not source_vel_events or blend <= 0.0:
+        return 0
+
+    by_pitch: dict[int, list[list]] = {}
+    for t_sec, pitch, _ in source_vel_events:
+        by_pitch.setdefault(int(pitch), []).append([float(t_sec), False])
+
+    aligned = 0
+    for n in notes:
+        cands = by_pitch.get(int(n["pitch"]))
+        if not cands:
+            continue
+        t_target = float(n["st"])
+        best_idx = -1
+        best_err = max_shift_sec + 1.0
+        for idx, item in enumerate(cands):
+            if item[1]:
+                continue
+            err = abs(item[0] - t_target)
+            if err <= max_shift_sec and err < best_err:
+                best_err = err
+                best_idx = idx
+        if best_idx >= 0:
+            cands[best_idx][1] = True
+            delta = blend * (cands[best_idx][0] - t_target)
+            new_st = max(0.0, t_target + delta)
+            dur = max(0.08, float(n["et"]) - t_target)
+            n["st"] = new_st
+            n["et"] = new_st + dur
+            n["timing_aligned_transkun"] = True
+            aligned += 1
+    return aligned
