@@ -765,3 +765,32 @@ def test_real_midi_pedal_reader_and_bar0_fallback(tmp_path: Path) -> None:
     ]
     fb = pv.compute_dynamic_pedal_events(notes_bar0, tmap, max_bar=1, rate=48000, pedal_style="legato_harmonic")
     assert any(ev["sample"] < int(3.5 * 48000) and ev["value"] > 0 for ev in fb)
+
+
+def test_microtiming_alignment_soft_velocity_and_hall_reverb() -> None:
+    """Verify micro-timing alignment, delicate soft velocity preservation, and finite stereo hall reverb."""
+    pv = _load_script("pedal_and_velocity.py")
+    s4 = _load_script("stage4_render_calibrated.py")
+
+    notes = [
+        {"st": 1.00, "et": 1.50, "pitch": 74, "staff": 1, "calc_vel": 64},
+        {"st": 1.00, "et": 1.50, "pitch": 77, "staff": 1, "calc_vel": 64},
+    ]
+    raw_evs = [(0.97, 74, 16), (1.02, 77, 78), (1.50, 60, 50)]
+    fused = pv.fuse_transkun_velocities(notes, raw_evs, alpha=0.92, lh_ceiling_vel=90)
+    assert fused == 2
+    assert notes[0]["calc_vel"] <= 22  # soft inner voice stays genuinely delicate (< 24 old floor)
+    assert notes[1]["calc_vel"] >= 74
+
+    aligned = pv.align_microtiming_to_transkun(notes, raw_evs, blend=0.80, max_shift_sec=0.10)
+    assert aligned == 2
+    assert notes[0]["st"] < 0.99 and notes[1]["st"] > 1.01
+
+    sr = 16000
+    imp = np.zeros((sr, 2), dtype=np.float64)
+    imp[100, :] = 0.5
+    out = s4.apply_natural_hall_reverb(imp, sr, wet_mix=0.18, rt60_sec=1.0)
+    assert out.shape == imp.shape
+    assert np.all(np.isfinite(out))
+    # Reverb tail must exist after the impulse (> 0.05s later)
+    assert float(np.sqrt(np.mean(out[int(0.08 * sr) : int(0.30 * sr)] ** 2))) > 1e-4
