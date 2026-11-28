@@ -1103,3 +1103,215 @@ def test_stage4_closed_loop_velocity_calibration_balances_chord() -> None:
     assert med_err > 2.5
     assert notes[0]["calc_vel"] > 78  # D5 boosted
     assert notes[1]["calc_vel"] < 70  # F5 attenuated
+
+
+def test_closed_loop_stereo_comb_no_false_boost() -> None:
+    """PR #21: 3 ms L/R stereo delay at B4 (~494 Hz) must NOT trigger a false boost in 2D stereo mode,
+    while collapsing to mono via mean(axis=1) reproduces the old comb-filter false boost (>= +6 vel)."""
+    pv = _load_script("pedal_and_velocity.py")
+    sr = 48000
+    t = np.arange(int(sr * 1.5), dtype=np.float64) / sr
+    f_b4 = 440.0 * (2.0 ** ((71 - 69) / 12.0))  # 493.88 Hz (3 ms delay ~ 1.48 cycles -> near-cancel!)
+    env = np.where((t >= 0.2) & (t < 1.2), np.exp(-1.5 * np.maximum(0.0, t - 0.2)), 0.0)
+    tone = env * 0.25 * np.sin(2.0 * np.pi * f_b4 * t)
+    # Add a broadband/bass reference tone at 110 Hz (A2) so global RMS stays steady
+    ref_tone = env * 0.25 * np.sin(2.0 * np.pi * 110.0 * t)
+    orig_st = np.column_stack([tone + ref_tone, tone + ref_tone])
+
+    delay = 144  # 3.0 ms @ 48 kHz
+    tone_r = np.concatenate([np.zeros(delay), tone[:-delay]])
+    ref_r = np.concatenate([np.zeros(delay), ref_tone[:-delay]])
+    rend_st = np.column_stack([tone + ref_tone, tone_r + ref_r])
+
+    notes_st = [{"st": 0.2, "et": 1.2, "pitch": 71, "staff": 1, "calc_vel": 66}]
+    pv.closed_loop_velocity_calibration(notes_st, orig_st, sr, rend_st, sr)
+    assert abs(notes_st[0]["calc_vel"] - 66) <= 2
+
+    # Same stereo render folded to mono triggers comb-filter null -> false boost >= 6
+    notes_mono = [{"st": 0.2, "et": 1.2, "pitch": 71, "staff": 1, "calc_vel": 66}]
+    pv.closed_loop_velocity_calibration(notes_mono, orig_st.mean(axis=1), sr, rend_st.mean(axis=1), sr)
+    assert (notes_mono[0]["calc_vel"] - 66) >= 6
+
+
+def test_closed_loop_velocity_caps() -> None:
+    """PR #21: Closed-loop calibration enforces RH <= 94, LH <= 90, and single-pass rise <= 16."""
+    pv = _load_script("pedal_and_velocity.py")
+    sr = 16000
+    t = np.arange(sr * 2, dtype=np.float64) / sr
+    env = np.where((t >= 0.3) & (t < 1.5), np.exp(-1.5 * np.maximum(0.0, t - 0.3)), 0.0)
+    f_rh = 440.0 * (2.0 ** ((72 - 69) / 12.0))
+    f_lh = 440.0 * (2.0 ** ((48 - 69) / 12.0))
+    f_mid = 440.0 * (2.0 ** ((64 - 69) / 12.0))
+
+    # Original has strong RH/LH; render has them 20 dB softer while mid tone anchors global RMS
+    orig = env * (0.30 * np.sin(2 * np.pi * f_rh * t) + 0.30 * np.sin(2 * np.pi * f_lh * t) + 0.30 * np.sin(2 * np.pi * f_mid * t))
+    rend = env * (0.03 * np.sin(2 * np.pi * f_rh * t) + 0.03 * np.sin(2 * np.pi * f_lh * t) + 0.30 * np.sin(2 * np.pi * f_mid * t))
+
+    notes = [
+        {"st": 0.3, "et": 1.5, "pitch": 72, "staff": 1, "calc_vel": 90},
+        {"st": 0.3, "et": 1.5, "pitch": 48, "staff": 2, "calc_vel": 86},
+        {"st": 0.3, "et": 1.5, "pitch": 64, "staff": 1, "calc_vel": 50},
+    ]
+    pv.closed_loop_velocity_calibration(notes, orig, sr, rend, sr)
+    assert notes[0]["calc_vel"] <= 94 and (notes[0]["calc_vel"] - 90) <= 16
+    assert notes[1]["calc_vel"] <= 90 and (notes[1]["calc_vel"] - 86) <= 16
+
+    # Also verify max_rise_vel=16 cap on a lower starting velocity (50 -> <= 66)
+    notes_low = [
+        {"st": 0.3, "et": 1.5, "pitch": 72, "staff": 1, "calc_vel": 50},
+        {"st": 0.3, "et": 1.5, "pitch": 64, "staff": 1, "calc_vel": 60},
+    ]
+    pv.closed_loop_velocity_calibration(notes_low, orig, sr, rend, sr)
+    assert notes_low[0]["calc_vel"] <= 66
+
+
+def test_raw_midi_notes_capped_by_staff() -> None:
+    """PR #21: build_performance_notes_from_raw_midi caps RH <= 94 and LH <= 90."""
+    pv = _load_script("pedal_and_velocity.py")
+    raw_events = [
+        (0.5, 1.0, 72, 120),  # RH C5
+        (0.5, 1.0, 48, 120),  # LH C3
+    ]
+    perf, _ = pv.build_performance_notes_from_raw_midi(raw_events, [])
+    by_p = {n["pitch"]: n for n in perf}
+    assert by_p[72]["staff"] == 1 and by_p[72]["calc_vel"] <= 94
+    assert by_p[48]["staff"] == 2 and by_p[48]["calc_vel"] <= 90
+
+
+def test_integrated_lufs_sine_reference() -> None:
+    """PR #21: BS.1770 integrated_lufs on 997 Hz stereo sine (amp 0.1) matches 20*log10(0.1) within 0.5 LU."""
+    am = _load_script("audio_match.py")
+    sr = 48000
+    t = np.arange(sr * 2, dtype=np.float64) / sr
+    s = 0.1 * np.sin(2.0 * np.pi * 997.0 * t)
+    stereo = np.column_stack([s, s])
+    lufs = am.integrated_lufs(stereo, sr)
+    ref = 20.0 * np.log10(0.1)
+    assert abs(lufs - ref) <= 0.5
+
+
+def test_peak_limiter_keeps_loudness() -> None:
+    """PR #21: Lookahead peak limiter caps a 10 ms 0 dBFS spike to <= -1.0 dBFS with <= 0.3 LU loudness drop."""
+    am = _load_script("audio_match.py")
+    sr = 48000
+    rng = np.random.default_rng(7)
+    noise = rng.standard_normal((sr * 3, 2))
+    noise *= 10.0 ** ((-20.0 - am.integrated_lufs(noise, sr)) / 20.0)
+    lufs_clean = am.integrated_lufs(noise, sr)
+
+    spiked = noise.copy()
+    spiked[sr : sr + int(0.010 * sr), :] = 1.0
+    limited = am.apply_peak_limiter(spiked, sr, ceiling_db=-1.0, attack_ms=5.0, release_ms=80.0)
+    peak_db = 20.0 * np.log10(float(np.max(np.abs(limited))))
+    lufs_lim = am.integrated_lufs(limited, sr)
+    assert peak_db <= -0.99
+    assert (lufs_clean - lufs_lim) <= 0.3
+
+
+def test_detect_sound_end_and_pedal_release() -> None:
+    """PR #21: detect_sound_end locates 10.0s decay end within 0.1s and extends pedal release accordingly."""
+    am = _load_script("audio_match.py")
+    sr = 24000
+    rng = np.random.default_rng(11)
+    t = np.arange(sr * 12, dtype=np.float64) / sr
+    env = np.where(t < 10.0, np.exp(-0.4 * t), 0.0)
+    sig = rng.standard_normal((len(t), 2)) * env[:, None] * 0.25
+    sound_end = am.detect_sound_end(sig, sr, floor_db=-60.0)
+    assert abs(sound_end - 10.0) <= 0.1
+    release_t = max(8.0 + 0.15, 0.0, sound_end - 0.5)
+    assert release_t >= sound_end - 0.5
+
+
+def test_match_eq_darkens_bright_render() -> None:
+    """PR #21: Match EQ darkens bright white noise toward -30 dB (>2 kHz) dark reference with max boost <= +3 dB."""
+    am = _load_script("audio_match.py")
+    sr = 48000
+    rng = np.random.default_rng(19)
+    wn = rng.standard_normal((sr * 3, 2)) * 0.05
+    bf, rend_db = am.long_term_spectrum_db(wn, sr)
+    dark_orig = am.apply_eq_fft(wn, sr, bf, np.where(bf >= 2000.0, -30.0, 0.0))
+    _, orig_db = am.long_term_spectrum_db(dark_orig, sr)
+
+    gains = am.design_match_eq(orig_db, rend_db, band_freqs=bf, strength=0.7, max_boost_db=3.0, max_cut_db=24.0)
+    assert float(np.max(gains)) <= 3.01
+    matched = am.apply_eq_fft(wn, sr, bf, gains)
+    _, matched_db = am.long_term_spectrum_db(matched, sr)
+    i4 = int(np.argmin(np.abs(bf - 4000.0)))
+    i8 = int(np.argmin(np.abs(bf - 8000.0)))
+    assert abs(matched_db[i4] - orig_db[i4]) <= 10.0
+    assert abs(matched_db[i8] - orig_db[i8]) <= 12.0
+
+
+def test_estimate_rt60_synthetic_decay() -> None:
+    """PR #21: estimate_decay_rate recovers synthetic RT60 = 2.5s within 15% and returns None for 0.5s tails."""
+    am = _load_script("audio_match.py")
+    sr = 24000
+    rng = np.random.default_rng(23)
+    rt_true = 2.5
+    t = np.arange(sr * 4, dtype=np.float64) / sr
+    # Amplitude decays by 60 dB in rt_true seconds: 10^(-3 * t / rt_true) = exp(-6.907755 * t / rt_true)
+    dec = rng.standard_normal((len(t), 2)) * np.exp(-6.907755 * t / rt_true)[:, None]
+    res = am.estimate_decay_rate(dec, sr, 0.0, 3.8)
+    assert res is not None
+    rate_db_s, r2 = res
+    rt_est = 60.0 / abs(rate_db_s)
+    assert r2 >= 0.8
+    assert abs(rt_est - rt_true) / rt_true <= 0.15
+    assert am.estimate_decay_rate(dec, sr, 0.0, 0.5) is None
+
+
+def test_read_soft_pedal_spans(tmp_path: Path) -> None:
+    """PR #21: read_midi_soft_pedal_spans parses two CC67 intervals with <10 ms error and accurate soft_ratio."""
+    pv = _load_script("pedal_and_velocity.py")
+    mid = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    tr.append(mido.MetaMessage("set_tempo", tempo=500_000, time=0))  # 960 ticks/sec
+    # Span 1: 1.0s .. 3.0s
+    tr.append(mido.Message("control_change", control=67, value=127, time=960))
+    tr.append(mido.Message("control_change", control=67, value=0, time=1920))
+    # Span 2: 5.0s .. 10.0s (open until end_of_track at 10.0s)
+    tr.append(mido.Message("control_change", control=67, value=127, time=1920))
+    tr.append(mido.MetaMessage("end_of_track", time=4800))
+    mid.tracks.append(tr)
+    p_mid = tmp_path / "soft_pedal.mid"
+    mid.save(str(p_mid))
+
+    spans = pv.read_midi_soft_pedal_spans(p_mid)
+    assert len(spans) == 2
+    assert abs(spans[0][0] - 1.0) < 0.01 and abs(spans[0][1] - 3.0) < 0.01
+    assert abs(spans[1][0] - 5.0) < 0.01 and abs(spans[1][1] - 10.0) < 0.01
+    soft_ratio = sum(b - a for a, b in spans) / 10.0
+    assert abs(soft_ratio - 0.7) < 0.01
+
+
+def test_stage5_stereo_excerpts_and_outro(tmp_path: Path) -> None:
+    """PR #21: Stage 5 outputs 2-channel stereo clips (L != R) and 12s outro covering original's sound end."""
+    s5 = _load_script("stage5_ab_excerpts.py")
+    sr = 16000
+    t_orig = np.arange(sr * 18, dtype=np.float64) / sr
+    # Distinct L (440 Hz) and R (554.37 Hz) stereo orig ending at 16.0s
+    env_o = np.where(t_orig < 16.0, 0.2, 0.0)
+    orig = np.column_stack([env_o * np.sin(2 * np.pi * 440.0 * t_orig), env_o * np.sin(2 * np.pi * 554.37 * t_orig)])
+    # Render is 3s shorter (ends at 13.0s)
+    t_rend = np.arange(sr * 13, dtype=np.float64) / sr
+    rend = np.column_stack([0.2 * np.sin(2 * np.pi * 440.0 * t_rend), 0.2 * np.sin(2 * np.pi * 554.37 * t_rend)])
+
+    orig_p = tmp_path / "orig.wav"
+    rend_p = tmp_path / "rend.wav"
+    out_d = tmp_path / "ab"
+    sf.write(str(orig_p), orig, sr, subtype="PCM_16")
+    sf.write(str(rend_p), rend, sr, subtype="PCM_16")
+
+    res = s5.generate_ab_excerpts(orig_p, rend_p, out_d, first_downbeat=1.0, loudness_match=True)
+    assert len(res) == 3
+    assert not list(out_d.glob("*_LR.wav"))
+
+    outro_o, sr_out = sf.read(str(out_d / "AB_03_outro_orig.wav"), always_2d=True)
+    outro_r, _ = sf.read(str(out_d / "AB_03_outro_render.wav"), always_2d=True)
+    outro_s, _ = sf.read(str(out_d / "AB_03_outro_seq.wav"), always_2d=True)
+    assert outro_o.shape[1] == 2 and outro_r.shape[1] == 2 and outro_s.shape[1] == 2
+    assert float(np.mean(np.abs(outro_o[:, 0] - outro_o[:, 1]))) > 1e-3  # L != R preserved
+    assert abs(outro_o.shape[0] / sr_out - 12.0) < 0.05
+    assert abs(outro_r.shape[0] / sr_out - 12.0) < 0.05
+    # Outro starts at 16.0 - 10.0 = 6.0s -> orig has active sound through t=10.0s of the 12s clip
+    assert float(np.sqrt(np.mean(outro_o[int(9.0 * sr_out) : int(9.8 * sr_out)] ** 2))) > 0.05
