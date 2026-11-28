@@ -147,7 +147,7 @@ def generate_ab_excerpts(
     rend = ensure_stereo(r_raw)
 
     sound_end_orig = detect_sound_end(orig, sr, floor_db=-60.0)
-    opening_t0 = max(0.0, float(first_downbeat) - 1.0)
+    opening_t0 = 0.0
     climax_t0 = find_climax_start(orig, sr, win_sec=12.0)
     outro_t0 = max(0.0, sound_end_orig - 10.0)
 

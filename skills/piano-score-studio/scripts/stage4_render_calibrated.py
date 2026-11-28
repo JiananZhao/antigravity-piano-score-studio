@@ -731,6 +731,9 @@ def main() -> None:
         else float(np.clip(0.18 + 0.04 * (rt60_used - 2.0), 0.12, 0.35))
     )
     print(f"Stage 4 Adaptive Reverb: rt60_est={rt60_est}, rt60_used={rt60_used:.2f}s, wet_mix={reverb_wet:.3f}")
+    min_reverb_samples = int(round((orig_sound_end + 1.5 + rt60_used) * sr))
+    if len(sig_eq) < min_reverb_samples:
+        sig_eq = np.pad(sig_eq, ((0, min_reverb_samples - len(sig_eq)), (0, 0)), mode="constant")
     final_sig = apply_natural_hall_reverb(sig_eq, sr, wet_mix=reverb_wet, rt60_sec=rt60_used)
 
     # Stereo LUFS alignment + lookahead peak limiter (up to 2 rounds, no whole-track peak crush)
@@ -747,18 +750,23 @@ def main() -> None:
         if abs(lufs_render - target_lufs) <= 0.3:
             break
 
-    # Truncate cleanly at orig_sound_end + 1.5s with 1.0s fade-out
+    # Measure natural tail decay BEFORE applying the final 1.0s fade-out
     target_end_samples = int(round((orig_sound_end + 1.5) * sr))
     if len(final_sig) > target_end_samples:
         final_sig = final_sig[:target_end_samples].copy()
+    pre_fade_sound_end = detect_sound_end(final_sig, sr, floor_db=-60.0)
+    decay_rend = estimate_decay_rate(
+        final_sig, sr, last_note_on + 0.2, min(pre_fade_sound_end, orig_sound_end + 0.5), band=(400.0, 1500.0)
+    )
+    decay_rate_render_db_s = float(decay_rend[0]) if decay_rend is not None else None
+
+    # Apply 1.0s fade-out at the end (orig_sound_end + 0.5s .. + 1.5s)
     fade_len = min(len(final_sig), int(round(1.0 * sr)))
     if fade_len > 1:
         final_sig[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)[:, None]
 
     peak_dbfs = float(20.0 * np.log10(max(float(np.max(np.abs(final_sig))), 1e-12))) if len(final_sig) else -120.0
     sound_end_render = detect_sound_end(final_sig, sr, floor_db=-60.0)
-    decay_rend = estimate_decay_rate(final_sig, sr, last_note_on + 0.2, sound_end_render, band=(400.0, 1500.0))
-    decay_rate_render_db_s = float(decay_rend[0]) if decay_rend is not None else None
 
     full_wav = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.wav"
     full_mp3 = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.mp3"
