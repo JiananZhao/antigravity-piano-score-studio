@@ -358,9 +358,9 @@ def simplify_bar_hand(
     anchor_is_lower = True
     for sl in slots:
         for seg in by_s[sl]:
-            if seg.dur >= anchor_min_dur:
+            if seg.dur >= anchor_min_dur or seg.tie_start:
                 later = [s2 for s2 in slots if sl < s2 < sl + seg.dur]
-                if len(later) >= 2:
+                if seg.dur >= anchor_min_dur and len(later) >= 2:
                     lp = [x.pitch for s2 in later for x in by_s[s2]]
                     if seg.pitch < min(lp):
                         anchor_segs.append(seg)
@@ -368,6 +368,11 @@ def simplify_bar_hand(
                     elif seg.pitch > max(lp):
                         anchor_segs.append(seg)
                         anchor_is_lower = False
+                elif seg.tie_start and len(later) >= 1:
+                    # P1-1: promote cross-bar held notes to second voice so they are not truncated
+                    lp = [x.pitch for s2 in later for x in by_s[s2]]
+                    anchor_segs.append(seg)
+                    anchor_is_lower = seg.pitch < (sum(lp) / len(lp))
 
     if anchor_segs:
         a_ids = {id(s) for s in anchor_segs}
