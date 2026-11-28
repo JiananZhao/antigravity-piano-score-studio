@@ -26,10 +26,11 @@ from tempo_map import TempoMap, load_tempo_map
 from style_analyzer import load_style_profile
 from pedal_and_velocity import (
     align_microtiming_to_transkun,
+    calibrate_chord_voicing_from_audio,
     compute_dynamic_pedal_events,
     fuse_transkun_velocities,
     read_midi_pedal_events,
-    read_midi_velocity_events,
+    read_midi_performance_events,
 )
 
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -99,6 +100,9 @@ def parse_notes_from_xml(
                 raw_items.append((on, dur, midi, staff, ts, te, arp))
 
         bar_slot_0 = (bar_units - max_end) if (b == 0 and implicit) else (b * bar_units)
+        # Sort chronologically by onset slot (with tie_stop before new attacks) so voice 1/2
+        # ordering in MusicXML never closes or orphans a cross-bar tie from the prior measure.
+        raw_items.sort(key=lambda item: (item[0], 0 if item[4] else 1, item[3], item[2]))
         for on, dur, midi, staff, ts, te, arp in raw_items:
             gs, ge = bar_slot_0 + on, bar_slot_0 + on + dur
             key = (staff, midi)
@@ -498,13 +502,18 @@ def main() -> None:
     lh_ceiling_vel = int(dyn_cfg.get("lh_ceiling_vel", 90))
 
     if args.transkun_midi and Path(args.transkun_midi).is_file():
-        src_vels = read_midi_velocity_events(Path(args.transkun_midi))
+        src_perf = read_midi_performance_events(Path(args.transkun_midi))
+        src_vels = [(st, p, v) for st, _, p, v in src_perf]
         fused_cnt = fuse_transkun_velocities(notes, src_vels, alpha=0.92, lh_ceiling_vel=lh_ceiling_vel)
         if fused_cnt > 0:
             print(f"Stage 4 TransKun velocity fusion applied to {fused_cnt}/{len(notes)} notes (alpha=0.92, lh_ceiling={lh_ceiling_vel})")
-        aligned_cnt = align_microtiming_to_transkun(notes, src_vels, blend=0.80, max_shift_sec=0.10)
+        aligned_cnt = align_microtiming_to_transkun(notes, src_perf, blend=0.80, max_shift_sec=0.14)
         if aligned_cnt > 0:
-            print(f"Stage 4 TransKun micro-timing alignment applied to {aligned_cnt}/{len(notes)} notes")
+            print(f"Stage 4 TransKun micro-timing & sustain restoration applied to {aligned_cnt}/{len(notes)} notes")
+
+    voiced_cnt = calibrate_chord_voicing_from_audio(notes, mono_orig, sr_orig)
+    if voiced_cnt > 0:
+        print(f"Stage 4 acoustic chord-voicing attenuation applied to {voiced_cnt} inner/soft chord notes")
 
     # Round 1 static dynamics check
     rh_med = float(np.median([n["calc_vel"] for n in rh_all])) if rh_all else 0.0
