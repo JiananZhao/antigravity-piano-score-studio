@@ -364,8 +364,8 @@ def test_style_profiles_and_dynamic_eval_rubric() -> None:
         assert prof["profile_id"] == pid
         assert required_sections.issubset(prof.keys())
 
-    # Balanced Baroque counterpoint (rh_med=84, lh_med=82, lh_max=98) warns on default rubric
-    # and PASSES under baroque_polyphonic dynamic rubric.
+    # Balanced Baroque counterpoint (rh_med=84, lh_med=82, lh_max=98) fails legacy Pop rubric
+    # but PASSES under baroque_polyphonic dynamic rubric.
     assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0) == "WARN"
     baroque_rubric = load_style_profile("baroque_polyphonic")["eval_rubric"]
     assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0, eval_rubric=baroque_rubric) == "PASS"
@@ -1024,3 +1024,82 @@ def test_stage4_export_mp3_from_wav_graceful_skip_and_real(tmp_path: Path, monke
     if shutil.which("ffmpeg"):
         res = s4.export_mp3_from_wav(wav_p, mp3_p)
         assert res == mp3_p and mp3_p.is_file() and mp3_p.stat().st_size > 1000
+
+
+def test_stage4_direct_performance_midi_zero_drift_and_ghost_removal(tmp_path: Path) -> None:
+    """PR #20 Root Fix 1: Direct raw MIDI mode preserves exact rubato arpeggio timing (0ms drift)
+    even when XML quantization shifted a note >140ms, while removing Stage 2 confirmed ghosts."""
+    pv = _load_script("pedal_and_velocity.py")
+    build_performance_notes_from_raw_midi = pv.build_performance_notes_from_raw_midi
+    load_confirmed_ghosts_from_audit = pv.load_confirmed_ghosts_from_audit
+
+    audit_path = tmp_path / "pitch_audit.json"
+    audit_path.write_text(
+        json.dumps(
+            {
+                "minor2nd_clashes": [
+                    {"t_on": 73.77, "weaker_midi": 57, "verdict": "CONFIRMED_GHOST"},
+                    {"t_on": 173.60, "weaker_midi": 75, "verdict": "REAL_DISSONANCE"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    ghosts = load_confirmed_ghosts_from_audit(audit_path)
+    assert ghosts == [(73.77, 57)]
+
+    raw_events = [
+        (14.569, 14.880, 67, 68),
+        (14.800, 14.950, 63, 64),
+        (15.060, 15.336, 70, 66),  # quantized XML drifted 150ms early to 14.910
+        (73.772, 73.850, 57, 32),  # confirmed ghost A3
+        (173.600, 174.100, 75, 58),  # real dissonance Eb5 (must stay)
+    ]
+    xml_notes = [
+        {"st": 14.576, "et": 14.880, "pitch": 67, "staff": 1, "measure": 3},
+        {"st": 14.823, "et": 15.125, "pitch": 63, "staff": 1, "measure": 3},
+        {"st": 14.910, "et": 15.213, "pitch": 70, "staff": 1, "measure": 3},
+        {"st": 173.600, "et": 174.100, "pitch": 75, "staff": 1, "measure": 43},
+    ]
+
+    perf_notes, removed = build_performance_notes_from_raw_midi(
+        raw_events, xml_notes, confirmed_ghosts=ghosts, max_bar=50
+    )
+    assert removed == 1
+    assert len(perf_notes) == 4
+    by_p = {n["pitch"]: n for n in perf_notes}
+    assert 57 not in by_p
+    assert 75 in by_p
+    # Exact 0ms drift on Bb4 (70) despite 150ms XML quantization error
+    assert abs(by_p[70]["st"] - 15.060) < 1e-6
+    assert abs(by_p[70]["et"] - 15.336) < 1e-6
+    assert by_p[70]["staff"] == 1
+    assert by_p[70]["measure"] == 3
+
+
+def test_stage4_closed_loop_velocity_calibration_balances_chord() -> None:
+    """PR #20 Root Fix 2: Closed-loop calibration boosts under-loud D5 and attenuates over-loud F5
+    based on actual rendered-vs-original per-note dB difference."""
+    pv = _load_script("pedal_and_velocity.py")
+    closed_loop_velocity_calibration = pv.closed_loop_velocity_calibration
+
+    sr = 16000
+    t = np.arange(sr * 2, dtype=np.float64) / sr
+    f_d5 = 440.0 * (2.0 ** ((74 - 69) / 12.0))
+    f_f5 = 440.0 * (2.0 ** ((77 - 69) / 12.0))
+    env = np.where((t >= 0.5) & (t < 1.5), np.exp(-2.0 * np.maximum(0.0, t - 0.5)), 0.0)
+
+    # Original: D5 and F5 equal loudness
+    mono_orig = env * (0.25 * np.sin(2.0 * np.pi * f_d5 * t) + 0.25 * np.sin(2.0 * np.pi * f_f5 * t))
+    # Pass-1 render (equal total RMS): Salamander-like imbalance where D5 is too soft and F5 is too loud
+    mono_rend = env * (0.10 * np.sin(2.0 * np.pi * f_d5 * t) + 0.34 * np.sin(2.0 * np.pi * f_f5 * t))
+
+    notes = [
+        {"st": 0.5, "et": 1.5, "pitch": 74, "staff": 1, "calc_vel": 70},
+        {"st": 0.5, "et": 1.5, "pitch": 77, "staff": 1, "calc_vel": 76},
+    ]
+    adj, med_err = closed_loop_velocity_calibration(notes, mono_orig, sr, mono_rend, sr)
+    assert adj == 2
+    assert med_err > 2.5
+    assert notes[0]["calc_vel"] > 78  # D5 boosted
+    assert notes[1]["calc_vel"] < 70  # F5 attenuated

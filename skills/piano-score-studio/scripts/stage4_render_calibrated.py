@@ -26,9 +26,12 @@ from tempo_map import TempoMap, load_tempo_map
 from style_analyzer import load_style_profile
 from pedal_and_velocity import (
     align_microtiming_to_transkun,
+    build_performance_notes_from_raw_midi,
     calibrate_chord_voicing_from_audio,
+    closed_loop_velocity_calibration,
     compute_dynamic_pedal_events,
     fuse_transkun_velocities,
+    load_confirmed_ghosts_from_audit,
     read_midi_pedal_events,
     read_midi_performance_events,
 )
@@ -444,6 +447,7 @@ def main() -> None:
     ap.add_argument("--song-name", default="PianoPiece")
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
     ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities for touch fusion")
+    ap.add_argument("--pitch-audit", default=None, help="Optional Stage 2 pitch_audit.json for confirmed ghost removal on raw performance MIDI")
     ap.add_argument("--config", default=None)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
@@ -525,19 +529,41 @@ def main() -> None:
     pedal_style = str(dyn_cfg.get("pedal_style", "legato_harmonic"))
     lh_ceiling_vel = int(dyn_cfg.get("lh_ceiling_vel", 90))
 
+    used_raw_perf_source = False
     if args.transkun_midi and Path(args.transkun_midi).is_file():
         src_perf = read_midi_performance_events(Path(args.transkun_midi))
-        src_vels = [(st, p, v) for st, _, p, v in src_perf]
-        fused_cnt = fuse_transkun_velocities(notes, src_vels, alpha=0.92, lh_ceiling_vel=lh_ceiling_vel)
-        if fused_cnt > 0:
-            print(f"Stage 4 TransKun velocity fusion applied to {fused_cnt}/{len(notes)} notes (alpha=0.92, lh_ceiling={lh_ceiling_vel})")
-        aligned_cnt = align_microtiming_to_transkun(notes, src_perf, blend=0.80, max_shift_sec=0.14)
-        if aligned_cnt > 0:
-            print(f"Stage 4 TransKun micro-timing & sustain restoration applied to {aligned_cnt}/{len(notes)} notes")
+        raw_vels_arr = np.asarray([v for _, _, _, v in src_perf], dtype=np.float64) if src_perf else np.array([])
+        if len(src_perf) >= 3 and float(raw_vels_arr.std()) >= 2.0:
+            confirmed_ghosts = load_confirmed_ghosts_from_audit(Path(args.pitch_audit) if args.pitch_audit else None)
+            perf_notes, ghost_rm = build_performance_notes_from_raw_midi(
+                src_perf,
+                notes,
+                tempo_map=tmap,
+                confirmed_ghosts=confirmed_ghosts,
+                max_bar=max_bar,
+            )
+            if perf_notes:
+                notes = perf_notes
+                rh_all = [n for n in notes if n["staff"] == 1]
+                lh_all = [n for n in notes if n["staff"] == 2]
+                used_raw_perf_source = True
+                print(
+                    f"Stage 4 Direct Performance MIDI mode: {len(notes)} notes from {Path(args.transkun_midi).name} "
+                    f"(0ms quantization drift, {ghost_rm} confirmed ghost(s) removed)"
+                )
+        if not used_raw_perf_source and src_perf:
+            src_vels = [(st, p, v) for st, _, p, v in src_perf]
+            fused_cnt = fuse_transkun_velocities(notes, src_vels, alpha=0.92, lh_ceiling_vel=lh_ceiling_vel)
+            if fused_cnt > 0:
+                print(f"Stage 4 TransKun velocity fusion applied to {fused_cnt}/{len(notes)} notes (alpha=0.92, lh_ceiling={lh_ceiling_vel})")
+            aligned_cnt = align_microtiming_to_transkun(notes, src_perf, blend=0.80, max_shift_sec=0.22)
+            if aligned_cnt > 0:
+                print(f"Stage 4 TransKun micro-timing & sustain restoration applied to {aligned_cnt}/{len(notes)} notes")
 
-    voiced_cnt = calibrate_chord_voicing_from_audio(notes, mono_orig, sr_orig)
-    if voiced_cnt > 0:
-        print(f"Stage 4 acoustic chord-voicing attenuation applied to {voiced_cnt} inner/soft chord notes")
+    if not used_raw_perf_source:
+        voiced_cnt = calibrate_chord_voicing_from_audio(notes, mono_orig, sr_orig)
+        if voiced_cnt > 0:
+            print(f"Stage 4 acoustic chord-voicing attenuation applied to {voiced_cnt} inner/soft chord notes")
 
     # Round 1 static dynamics check
     rh_med = float(np.median([n["calc_vel"] for n in rh_all])) if rh_all else 0.0
@@ -560,21 +586,35 @@ def main() -> None:
                 nxt = [o["st"] for o in m_lh[i + 1 :] if o["pitch"] == n["pitch"]]
                 n["et"] = max(n["et"], (nxt[0] - 0.020) if nxt else (b_end - 0.015))
 
-    render_notes, clusters = [], []
-    for n in sorted(notes, key=lambda x: (x["st"], x["pitch"])):
-        if not clusters or abs(n["st"] - clusters[-1][0]["st"]) > 0.025:
-            clusters.append([n])
-        else:
-            clusters[-1].append(n)
-    for cl in clusters:
-        cl.sort(key=lambda x: x["pitch"])
-        has_arp = len(cl) > 1 and any(x["arpeggiate"] for x in cl)
-        all_human_timed = all(x.get("timing_aligned_transkun") for x in cl)
-        step = 0.018 if has_arp else (0.0 if all_human_timed else 0.008)
-        for idx, n in enumerate(cl):
-            st = n["st"] + (idx * step if len(cl) > 1 else 0.0)
-            dur = max(0.14, n["et"] - st) * (0.98 if n["staff"] == 1 else 1.0)
-            render_notes.append({"sample": max(0, int(round(st * rate))), "duration_samples": int(round(dur * rate)), "note": n["pitch"], "velocity": round(n.get("calc_vel", 64) / 127.0, 4), "channel": 1, "staff": n["staff"]})
+    def _build_render_notes(src_notes: list[dict]) -> list[dict]:
+        built, clusters = [], []
+        for n in sorted(src_notes, key=lambda x: (x["st"], x["pitch"])):
+            if not clusters or abs(n["st"] - clusters[-1][0]["st"]) > 0.025:
+                clusters.append([n])
+            else:
+                clusters[-1].append(n)
+        for cl in clusters:
+            cl.sort(key=lambda x: x["pitch"])
+            has_arp = len(cl) > 1 and any(x["arpeggiate"] for x in cl)
+            all_human_timed = all(x.get("timing_aligned_transkun") for x in cl)
+            step = 0.018 if has_arp else (0.0 if all_human_timed else 0.008)
+            min_dur = 0.05 if all_human_timed else 0.14
+            for idx, n in enumerate(cl):
+                st = n["st"] + (idx * step if len(cl) > 1 else 0.0)
+                dur = max(min_dur, n["et"] - st) * (1.0 if all_human_timed else (0.98 if n["staff"] == 1 else 1.0))
+                built.append(
+                    {
+                        "sample": max(0, int(round(st * rate))),
+                        "duration_samples": int(round(dur * rate)),
+                        "note": n["pitch"],
+                        "velocity": round(n.get("calc_vel", 64) / 127.0, 4),
+                        "channel": 1,
+                        "staff": n["staff"],
+                    }
+                )
+        return built
+
+    render_notes = _build_render_notes(notes)
     if len(real_pedals) >= 2:
         controllers = real_pedals + [
             {"sample": max(0, int(round((t_end + 0.15) * rate))), "channel": 1, "controller": 64, "value": 0}
@@ -597,9 +637,21 @@ def main() -> None:
     export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out, tempo_map=tmap)
 
     with tempfile.TemporaryDirectory() as tmpd:
-        raw_wav = Path(tmpd) / "raw.wav"
+        raw_wav = Path(tmpd) / "raw_pass1.wav"
         render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav, rate, int(round(t_end * rate)) + rate * 4)
         sig, sr = sf.read(str(raw_wav))
+        mono_pass1 = sig.mean(axis=1) if sig.ndim == 2 else sig
+        adj_cnt, med_err_db = closed_loop_velocity_calibration(notes, mono_orig, sr_orig, mono_pass1, sr)
+        if adj_cnt > 0:
+            print(
+                f"Stage 4 Closed-Loop Acoustic Calibration: adjusted {adj_cnt}/{len(notes)} notes "
+                f"(Pass-1 median |err|={med_err_db:.2f} dB); rendering Pass 2..."
+            )
+            render_notes = _build_render_notes(notes)
+            export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out, tempo_map=tmap)
+            raw_wav_p2 = Path(tmpd) / "raw_pass2.wav"
+            render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav_p2, rate, int(round(t_end * rate)) + rate * 4)
+            sig, sr = sf.read(str(raw_wav_p2))
 
     # Preserve natural Salamander Grand Piano timbre & dynamics:
     # Add gentle stereo concert-hall reverb + transparent whole-song RMS loudness alignment
