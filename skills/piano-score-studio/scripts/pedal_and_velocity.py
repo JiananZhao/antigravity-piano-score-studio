@@ -48,6 +48,7 @@ def compute_dynamic_pedal_events(
     pedal_style: str = "legato_harmonic",
     beats_per_bar: int = 4,
     beat_type: int = 4,
+    release_t: float | None = None,
 ) -> list[dict]:
     """Generate style-aware, chroma-flux-driven CC64 sustain pedal controller events."""
     _, t_end = tempo_map.bar_bounds_sec(max(1, max_bar))
@@ -113,7 +114,8 @@ def compute_dynamic_pedal_events(
                     [int(n["pitch"]) for n in step_notes]
                 ) if float(prev_chroma.sum()) <= 0 else (0.7 * prev_chroma + 0.3 * cur_chroma)
 
-    controllers.append({"sample": max(0, int(round((t_end + 0.10) * rate))), "channel": 1, "controller": 64, "value": 0})
+    final_rel = max(t_end + 0.10, float(release_t)) if release_t is not None else (t_end + 0.10)
+    controllers.append({"sample": max(0, int(round(final_rel * rate))), "channel": 1, "controller": 64, "value": 0})
     return controllers
 
 
@@ -147,6 +149,62 @@ def read_midi_pedal_events(midi_path: Path, rate: int = 48000) -> list[dict]:
                 }
             )
     return events if has_press else []
+
+
+def read_midi_soft_pedal_events(midi_path: Path, rate: int = 48000) -> list[dict]:
+    """Read raw CC67 (una corda / soft pedal) controller events from a performance MIDI."""
+    import mido
+
+    mid = mido.MidiFile(str(midi_path))
+    tpb = max(1, int(mid.ticks_per_beat))
+    cur_t = 0.0
+    cur_tempo = 500000
+    events: list[dict] = []
+    for msg in mido.merge_tracks(mid.tracks):
+        cur_t += mido.tick2second(msg.time, tpb, cur_tempo)
+        if msg.type == "set_tempo":
+            cur_tempo = msg.tempo
+        elif msg.type == "control_change" and msg.control == 67:
+            events.append(
+                {
+                    "sample": max(0, int(round(cur_t * rate))),
+                    "channel": 1,
+                    "controller": 67,
+                    "value": int(msg.value),
+                }
+            )
+    return events
+
+
+def read_midi_soft_pedal_spans(midi_path: Path) -> list[tuple[float, float]]:
+    """Read CC67 (soft pedal) active intervals in seconds (`value >= 64` = pressed).
+
+    Any span still open at end-of-track is closed at the timestamp of the last MIDI event.
+    """
+    import mido
+
+    mid = mido.MidiFile(str(midi_path))
+    tpb = max(1, int(mid.ticks_per_beat))
+    cur_t = 0.0
+    cur_tempo = 500000
+    spans: list[tuple[float, float]] = []
+    down_t: float | None = None
+    for msg in mido.merge_tracks(mid.tracks):
+        cur_t += mido.tick2second(msg.time, tpb, cur_tempo)
+        if msg.type == "set_tempo":
+            cur_tempo = msg.tempo
+        elif msg.type == "control_change" and msg.control == 67:
+            if int(msg.value) >= 64:
+                if down_t is None:
+                    down_t = cur_t
+            else:
+                if down_t is not None:
+                    if cur_t > down_t:
+                        spans.append((down_t, cur_t))
+                    down_t = None
+    if down_t is not None and cur_t > down_t:
+        spans.append((down_t, cur_t))
+    return spans
 
 
 def read_midi_velocity_events(midi_path: Path) -> list[tuple[float, int, int]]:
@@ -395,6 +453,8 @@ def build_performance_notes_from_raw_midi(
     confirmed_ghosts: Sequence[tuple[float, int]] = (),
     split_pitch: int = 60,
     max_bar: int = 1,
+    rh_cap: int = 94,
+    lh_cap: int = 90,
 ) -> tuple[list[dict], int]:
     """Build Stage 4 performance notes directly from raw TransKun MIDI (`score_raw.mid`).
 
@@ -479,7 +539,7 @@ def build_performance_notes_from_raw_midi(
                 "pitch": p,
                 "staff": staff,
                 "arpeggiate": False,
-                "calc_vel": int(np.clip(int(vel), 10, 118)),
+                "calc_vel": int(np.clip(int(vel), 10, rh_cap if staff == 1 else lh_cap)),
                 "timing_aligned_transkun": True,
                 "vel_fused_transkun": True,
                 "source_raw_midi": True,
@@ -503,64 +563,78 @@ def build_performance_notes_from_raw_midi(
 
 def closed_loop_velocity_calibration(
     notes: Sequence[dict],
-    mono_orig: np.ndarray,
+    orig: np.ndarray,
     sr_orig: int,
-    mono_rend: np.ndarray,
+    rend: np.ndarray,
     sr_rend: int,
     deadband_db: float = 2.0,
     damping: float = 0.72,
-    max_corr_db: float = 12.0,
+    max_corr_db: float = 6.0,
     vel_db_per_decade: float = 30.0,
     cluster_sec: float = 0.030,
+    rh_cap: int = 94,
+    lh_cap: int = 90,
+    min_vel: int = 10,
+    max_rise_vel: int = 16,
 ) -> tuple[int, float]:
     """Closed-loop Render-Measure-Correct per-note velocity calibration.
 
-    Compares actual Pass-1 rendered audio (`mono_rend`) against original audio (`mono_orig`)
-    at every note onset (grouped into simultaneous chord windows for fast vectorized FFT).
-    Compensates directly for soundfont per-pitch / per-velocity-layer loudness differences
-    (e.g. Salamander Grand Piano F5 sounding brighter/louder than D5 at equal MIDI velocity).
+    Accepts 1D mono or 2D `(N, C)` stereo arrays for `orig` and `rend`.
+    Computes per-channel windowed FFT power spectra and averages POWER across
+    channels (never summing L+R waveforms before FFT), preventing stereo AB-mic
+    comb-filter nulls (e.g. 3 ms delay cancelling ~175 Hz / ~525 Hz) from causing
+    false velocity boosts.
 
     Returns `(adjusted_note_count, median_abs_error_db)`.
     """
-    if not notes or len(mono_orig) < 512 or len(mono_rend) < 512:
+    orig_2d = np.asarray(orig, dtype=np.float64)
+    rend_2d = np.asarray(rend, dtype=np.float64)
+    if orig_2d.ndim == 1:
+        orig_2d = orig_2d[:, None]
+    if rend_2d.ndim == 1:
+        rend_2d = rend_2d[:, None]
+
+    if not notes or orig_2d.shape[0] < 512 or rend_2d.shape[0] < 512:
         return 0, 0.0
 
-    # Global active-region RMS offset so we calibrate relative voicing, never global gain
+    # Global active-region RMS offset using channel-averaged RMS^2 (no waveform folding)
     t_first = max(0.0, min(float(n["st"]) for n in notes))
     t_last = min(
-        len(mono_orig) / float(sr_orig),
-        len(mono_rend) / float(sr_rend),
+        orig_2d.shape[0] / float(sr_orig),
+        rend_2d.shape[0] / float(sr_rend),
         max(float(n["et"]) for n in notes) + 0.5,
     )
     if t_last <= t_first + 0.2:
         return 0, 0.0
 
-    o_seg = mono_orig[int(t_first * sr_orig) : int(t_last * sr_orig)]
-    r_seg = mono_rend[int(t_first * sr_rend) : int(t_last * sr_rend)]
-    rms_o = float(np.sqrt(np.mean(o_seg ** 2))) if len(o_seg) else 0.0
-    rms_r = float(np.sqrt(np.mean(r_seg ** 2))) if len(r_seg) else 0.0
-    if rms_o < 1e-6 or rms_r < 1e-6:
+    o_seg = orig_2d[int(t_first * sr_orig) : int(t_last * sr_orig)]
+    r_seg = rend_2d[int(t_first * sr_rend) : int(t_last * sr_rend)]
+    rms2_o = float(np.mean(o_seg ** 2)) if len(o_seg) else 0.0
+    rms2_r = float(np.mean(r_seg ** 2)) if len(r_seg) else 0.0
+    if rms2_o < 1e-12 or rms2_r < 1e-12:
         return 0, 0.0
-    global_diff_db = 20.0 * np.log10(rms_r / rms_o)
+    global_diff_db = 10.0 * float(np.log10(rms2_r / rms2_o))
 
     n_fft = 16384
     fs_o = np.fft.rfftfreq(n_fft, 1.0 / sr_orig)
     fs_r = np.fft.rfftfreq(n_fft, 1.0 / sr_rend)
 
-    def _spec_at(sig: np.ndarray, sr: int, t0: float, dur: float) -> np.ndarray | None:
+    def _spec_at(sig_2d: np.ndarray, sr: int, t0: float, dur: float) -> np.ndarray | None:
         i0 = max(0, int(round(t0 * sr)))
-        i1 = min(len(sig), int(round((t0 + dur) * sr)))
-        seg = sig[i0:i1]
-        if len(seg) < 128:
+        i1 = min(sig_2d.shape[0], int(round((t0 + dur) * sr)))
+        seg = sig_2d[i0:i1]
+        if seg.shape[0] < 128:
             return None
-        w = np.hanning(len(seg))
+        w = np.hanning(seg.shape[0])
         w_sum = float(np.sum(w)) * 0.5 + 1e-12
-        return (np.abs(np.fft.rfft(seg * w, n=n_fft)) / w_sum) ** 2
+        n_ch = seg.shape[1]
+        acc = np.zeros(n_fft // 2 + 1, dtype=np.float64)
+        for ch in range(n_ch):
+            acc += (np.abs(np.fft.rfft(seg[:, ch] * w, n=n_fft)) / w_sum) ** 2
+        return acc / float(n_ch)
 
     def _pitch_db(power_spec: np.ndarray, fs: np.ndarray, sr: int, pitch: int, chord_pitches: set[int]) -> float:
         f0 = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
-        # Mid/upper register: fundamental-dominated (avoids bass harmonic bleed);
-        # Bass register (<52): include H1+H2+H3 because low piano strings radiate mostly via H2/H3.
         if pitch >= 52:
             harm_weights = ((1, 1.0),) if (pitch + 12) in chord_pitches else ((1, 1.0), (2, 0.35))
         else:
@@ -576,7 +650,6 @@ def closed_loop_velocity_calibration(
                 tot += w_h * float(np.max(power_spec[m]))
         return 10.0 * float(np.log10(max(tot, 1e-12)))
 
-    # Group simultaneous notes into chord windows to reuse FFTs cleanly
     ordered = sorted(notes, key=lambda x: (float(x["st"]), int(x["pitch"])))
     clusters: list[list[dict]] = []
     for n in ordered:
@@ -589,11 +662,11 @@ def closed_loop_velocity_calibration(
     abs_errs: list[float] = []
     for cl in clusters:
         t_win = min(float(x["st"]) for x in cl)
-        sp_o = _spec_at(mono_orig, sr_orig, t_win + 0.010, 0.165)
-        sp_r = _spec_at(mono_rend, sr_rend, t_win + 0.010, 0.165)
+        sp_o = _spec_at(orig_2d, sr_orig, t_win + 0.010, 0.165)
+        sp_r = _spec_at(rend_2d, sr_rend, t_win + 0.010, 0.165)
         if sp_o is None or sp_r is None:
             continue
-        sp_o_pre = _spec_at(mono_orig, sr_orig, max(0.0, t_win - 0.090), 0.075)
+        sp_o_pre = _spec_at(orig_2d, sr_orig, max(0.0, t_win - 0.090), 0.075)
         chord_pitches = {int(x["pitch"]) for x in cl}
 
         for n in cl:
@@ -602,7 +675,6 @@ def closed_loop_velocity_calibration(
             rend_db = _pitch_db(sp_r, fs_r, sr_rend, p, chord_pitches)
             if max(orig_db, rend_db) < -55.0:
                 continue
-            # Skip if the exact same pitch was already ringing much louder right before onset
             if sp_o_pre is not None:
                 pre_db = _pitch_db(sp_o_pre, fs_o, sr_orig, p, chord_pitches)
                 if pre_db > orig_db + 4.0 and pre_db > -45.0:
@@ -615,7 +687,11 @@ def closed_loop_velocity_calibration(
 
             corr_db = float(np.clip(damping * err_db, -max_corr_db, max_corr_db))
             cur_v = int(n.get("calc_vel", 64))
-            new_v = int(np.clip(round(cur_v * (10.0 ** (-corr_db / vel_db_per_decade))), 10, 118))
+            staff_cap = int(rh_cap) if int(n.get("staff", 1)) == 1 else int(lh_cap)
+            raw_new_v = int(round(cur_v * (10.0 ** (-corr_db / vel_db_per_decade))))
+            if raw_new_v > cur_v + int(max_rise_vel):
+                raw_new_v = cur_v + int(max_rise_vel)
+            new_v = int(np.clip(raw_new_v, int(min_vel), staff_cap))
             if new_v != cur_v:
                 n["calc_vel"] = new_v
                 n["closed_loop_calibrated"] = True
