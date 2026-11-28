@@ -938,3 +938,66 @@ def test_p1_4_eval_gate_natural_reverb_match() -> None:
     assert evaluate_s4_r2_acoustic_match(nan_inf=1, peak_db=-1.0, tail_snr=85.0, env_corr=0.90) == "FAIL"
     assert evaluate_s4_r2_acoustic_match(nan_inf=0, peak_db=-0.1, tail_snr=85.0, env_corr=0.90) == "FAIL"
     assert evaluate_s4_r1_static_dynamics(False, rh_med=62.0, lh_med=58.0, lh_max=82, unclosed_wedges=0) == "WARN"
+
+
+def test_stage4_parse_xml_voice_order_no_phantom_cross_bar_tie(tmp_path: Path) -> None:
+    """Voice 1 after <backup> vs voice 2 at slot 0 must not orphan cross-bar ties into phantom attacks."""
+    s4 = _load_script("stage4_render_calibrated.py")
+    xml_text = """<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes><divisions>2</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+      <note><rest/><duration>4</duration><voice>1</voice><staff>1</staff></note>
+      <note><pitch><step>F</step><octave>5</octave></pitch><duration>4</duration><tie type="start"/><voice>1</voice><staff>1</staff></note>
+    </measure>
+    <measure number="2">
+      <note><rest/><duration>4</duration><voice>1</voice><staff>1</staff></note>
+      <note><pitch><step>F</step><octave>5</octave></pitch><duration>4</duration><voice>1</voice><staff>1</staff></note>
+      <backup><duration>8</duration></backup>
+      <note><pitch><step>F</step><octave>5</octave></pitch><duration>2</duration><tie type="stop"/><voice>2</voice><staff>1</staff></note>
+      <note><rest/><duration>6</duration><voice>2</voice><staff>1</staff></note>
+    </measure>
+  </part>
+</score-partwise>
+"""
+    xml_path = tmp_path / "voice_swap_tie.musicxml"
+    xml_path.write_text(xml_text, encoding="utf-8")
+    notes, _, _ = s4.parse_notes_from_xml(xml_path, bpm=60.0, beats_per_bar=4, first_downbeat=0.0)
+    # Must be exactly 2 real F5 notes (bar 1 held into bar 2, plus new F5 on bar 2 beat 3), NOT 3!
+    assert len(notes) == 2
+    assert abs(notes[0]["st"] - 2.0) < 1e-4 and abs(notes[0]["et"] - 5.0) < 1e-4
+    assert abs(notes[1]["st"] - 6.0) < 1e-4 and abs(notes[1]["et"] - 8.0) < 1e-4
+
+
+def test_stage4_sustain_restoration_and_acoustic_chord_voicing() -> None:
+    """Restoring raw durations prevents chord truncation, and acoustic voicing tames loud inner chord notes."""
+    pv = _load_script("pedal_and_velocity.py")
+
+    # 1. Sustain restoration from 4-tuple performance events
+    notes = [
+        {"st": 5.00, "et": 5.74, "pitch": 70, "staff": 1, "calc_vel": 77},
+        {"st": 5.00, "et": 5.74, "pitch": 77, "staff": 1, "calc_vel": 46},
+    ]
+    raw_perf = [
+        (5.02, 6.51, 70, 76),
+        (5.04, 6.78, 77, 45),
+    ]
+    cnt = pv.align_microtiming_to_transkun(notes, raw_perf, blend=0.80, max_shift_sec=0.14)
+    assert cnt == 2
+    assert (notes[0]["et"] - notes[0]["st"]) >= 1.45
+    assert (notes[1]["et"] - notes[1]["st"]) >= 1.70
+
+    # 2. Acoustic chord voicing: Bb4 (loud, 0.50) + F5 (very soft, 0.025 -> ~-26 dB)
+    sr = 16000
+    t = np.arange(int(sr * 1.0)) / sr
+    sig = 0.50 * np.sin(2.0 * np.pi * 466.16 * t) + 0.025 * np.sin(2.0 * np.pi * 698.46 * t)
+    chord_notes = [
+        {"st": 0.02, "et": 0.50, "pitch": 70, "staff": 1, "calc_vel": 77},
+        {"st": 0.02, "et": 0.50, "pitch": 77, "staff": 1, "calc_vel": 46},
+    ]
+    adj = pv.calibrate_chord_voicing_from_audio(chord_notes, sig, sr)
+    assert adj == 1
+    assert chord_notes[0]["calc_vel"] == 77
+    assert chord_notes[1]["calc_vel"] <= 16
