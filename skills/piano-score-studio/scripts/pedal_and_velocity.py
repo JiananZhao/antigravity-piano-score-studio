@@ -151,19 +151,36 @@ def read_midi_pedal_events(midi_path: Path, rate: int = 48000) -> list[dict]:
 
 def read_midi_velocity_events(midi_path: Path) -> list[tuple[float, int, int]]:
     """Read (start_sec, pitch, velocity) tuples from a MIDI file using its tempo map."""
+    return [(st, p, v) for st, _, p, v in read_midi_performance_events(midi_path)]
+
+
+def read_midi_performance_events(midi_path: Path) -> list[tuple[float, float, int, int]]:
+    """Read (start_sec, end_sec, pitch, velocity) tuples from a MIDI file using its tempo map."""
     import mido
 
     mid = mido.MidiFile(str(midi_path))
     tpb = max(1, int(mid.ticks_per_beat))
     cur_t = 0.0
     cur_tempo = 500000
-    events: list[tuple[float, int, int]] = []
+    active: dict[tuple[int, int], list[tuple[float, int]]] = {}
+    events: list[tuple[float, float, int, int]] = []
     for msg in mido.merge_tracks(mid.tracks):
         cur_t += mido.tick2second(msg.time, tpb, cur_tempo)
         if msg.type == "set_tempo":
             cur_tempo = msg.tempo
         elif msg.type == "note_on" and msg.velocity > 0:
-            events.append((cur_t, int(msg.note), int(msg.velocity)))
+            key = (getattr(msg, "channel", 0), int(msg.note))
+            active.setdefault(key, []).append((cur_t, int(msg.velocity)))
+        elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            key = (getattr(msg, "channel", 0), int(msg.note))
+            stk = active.get(key)
+            if stk:
+                st_s, vel = stk.pop(0)
+                events.append((st_s, max(st_s + 0.04, cur_t), int(msg.note), vel))
+    for (_, pitch), stk in active.items():
+        for st_s, vel in stk:
+            events.append((st_s, st_s + 0.25, int(pitch), vel))
+    events.sort(key=lambda x: (x[0], x[2]))
     return events
 
 
@@ -215,21 +232,28 @@ def fuse_transkun_velocities(
 
 def align_microtiming_to_transkun(
     notes: Sequence[dict],
-    source_vel_events: Sequence[tuple[float, int, int]],
+    source_events: Sequence[tuple],
     blend: float = 0.80,
-    max_shift_sec: float = 0.10,
+    max_shift_sec: float = 0.14,
 ) -> int:
-    """Gently shift rendered note onsets toward TransKun performance micro-timing.
+    """Shift rendered note onsets (and restore real sustain durations when 4-tuples are given)
+    toward TransKun performance timing.
 
-    Keeps the MusicXML score cleanly quantized while restoring natural human phrasing,
-    subtle chord rolls, and rubato breathing in the rendered audio.
+    Accepts either 3-tuples `(start_sec, pitch, velocity)` or 4-tuples
+    `(start_sec, end_sec, pitch, velocity)`. When `end_sec` is present, restores
+    finger-hold durations that were shortened during study-score chord simplification,
+    clamped safely before the next onset of the same pitch.
     """
-    if not notes or not source_vel_events or blend <= 0.0:
+    if not notes or not source_events or blend <= 0.0:
         return 0
 
     by_pitch: dict[int, list[list]] = {}
-    for t_sec, pitch, _ in source_vel_events:
-        by_pitch.setdefault(int(pitch), []).append([float(t_sec), False])
+    for ev in source_events:
+        if len(ev) >= 4:
+            st_s, et_s, pitch = float(ev[0]), float(ev[1]), int(ev[2])
+        else:
+            st_s, et_s, pitch = float(ev[0]), None, int(ev[1])
+        by_pitch.setdefault(pitch, []).append([st_s, et_s, False])
 
     aligned = 0
     for n in notes:
@@ -240,19 +264,105 @@ def align_microtiming_to_transkun(
         best_idx = -1
         best_err = max_shift_sec + 1.0
         for idx, item in enumerate(cands):
-            if item[1]:
+            if item[2]:
                 continue
             err = abs(item[0] - t_target)
             if err <= max_shift_sec and err < best_err:
                 best_err = err
                 best_idx = idx
         if best_idx >= 0:
-            cands[best_idx][1] = True
-            delta = blend * (cands[best_idx][0] - t_target)
+            raw_st, raw_et, _ = cands[best_idx]
+            cands[best_idx][2] = True
+            delta = blend * (raw_st - t_target)
             new_st = max(0.0, t_target + delta)
-            dur = max(0.08, float(n["et"]) - t_target)
+            score_dur = max(0.08, float(n["et"]) - t_target)
+            if raw_et is not None:
+                raw_dur = max(0.08, raw_et - raw_st)
+                eff_dur = max(score_dur, raw_dur)
+            else:
+                eff_dur = score_dur
             n["st"] = new_st
-            n["et"] = new_st + dur
+            n["et"] = new_st + eff_dur
             n["timing_aligned_transkun"] = True
             aligned += 1
+
+    # Prevent same-pitch overlaps after duration restoration
+    same_pitch: dict[int, list[dict]] = {}
+    for n in notes:
+        same_pitch.setdefault(int(n["pitch"]), []).append(n)
+    for grp in same_pitch.values():
+        grp.sort(key=lambda x: x["st"])
+        for i in range(len(grp) - 1):
+            nxt_st = float(grp[i + 1]["st"])
+            if float(grp[i]["et"]) > nxt_st - 0.015:
+                grp[i]["et"] = max(float(grp[i]["st"]) + 0.05, nxt_st - 0.015)
+
     return aligned
+
+
+def calibrate_chord_voicing_from_audio(
+    notes: Sequence[dict],
+    mono_orig: np.ndarray,
+    sr_orig: int,
+    cluster_sec: float = 0.045,
+) -> int:
+    """Attenuate inner/background chord tones whose real acoustic level in `mono_orig`
+    is markedly softer than the lead tone in the same simultaneous chord.
+
+    Compensates for compressed MIDI velocity predictions and Salamander Grand Piano's
+    shallow velocity-to-dB curve so soft harmonic/inner notes never stick out harshly.
+    """
+    if not notes or len(mono_orig) < 256:
+        return 0
+
+    def _note_onset_db(t_on: float, pitch: int) -> float:
+        f0 = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+        i0 = max(0, int((t_on - 0.005) * sr_orig))
+        i1 = min(len(mono_orig), int((t_on + 0.140) * sr_orig))
+        ch = mono_orig[i0:i1]
+        if len(ch) < 128:
+            return -80.0
+        n_fft = 16384
+        sp = np.abs(np.fft.rfft(ch * np.hanning(len(ch)), n=n_fft)) / (len(ch) + 1e-12)
+        fs = np.fft.rfftfreq(n_fft, 1.0 / sr_orig)
+        bw = max(f0 * 0.022, 3.5)
+        m1 = (fs >= f0 - bw) & (fs <= f0 + bw)
+        db1 = 20.0 * np.log10(float(np.max(sp[m1])) + 1e-12) if np.any(m1) else -80.0
+        f2 = 2.0 * f0
+        if f2 < sr_orig * 0.48:
+            m2 = (fs >= f2 - 2.0 * bw) & (fs <= f2 + 2.0 * bw)
+            db2 = 20.0 * np.log10(float(np.max(sp[m2])) + 1e-12) if np.any(m2) else -80.0
+            return max(db1, db2 - 4.0)
+        return db1
+
+    adjusted = 0
+    for staff_id in (1, 2):
+        st_notes = sorted(
+            [n for n in notes if int(n.get("staff", 1)) == staff_id and int(n["pitch"]) >= 48],
+            key=lambda x: (x["st"], x["pitch"]),
+        )
+        clusters: list[list[dict]] = []
+        for n in st_notes:
+            if not clusters or (float(n["st"]) - float(clusters[-1][0]["st"])) > cluster_sec:
+                clusters.append([n])
+            else:
+                clusters[-1].append(n)
+        for cl in clusters:
+            if len(cl) < 2:
+                continue
+            dbs = [_note_onset_db(float(x["st"]), int(x["pitch"])) for x in cl]
+            lead_idx = int(np.argmax(dbs))
+            max_db = dbs[lead_idx]
+            if max_db < -65.0:
+                continue
+            ref_vel = max(int(cl[lead_idx].get("calc_vel", 64)), max(int(x.get("calc_vel", 64)) for x in cl))
+            for x, ndb in zip(cl, dbs):
+                rel_db = ndb - max_db
+                if rel_db < -4.0:
+                    ceil_vel = int(np.clip(round(ref_vel * (10.0 ** (rel_db / 26.0))), 8, 118))
+                    cur_v = int(x.get("calc_vel", 64))
+                    if ceil_vel < cur_v:
+                        x["calc_vel"] = ceil_vel
+                        x["voicing_calibrated"] = True
+                        adjusted += 1
+    return adjusted
