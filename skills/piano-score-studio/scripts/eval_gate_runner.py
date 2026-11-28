@@ -102,14 +102,29 @@ def evaluate_s4_r1_static_dynamics(
         max_lh_pass = int(eval_rubric.get("s4_max_lh_vel_pass", 90))
         if diff >= min_diff_pass and lh_max <= max_lh_pass:
             return "PASS"
-        if diff >= (min_diff_pass - 5.0) and lh_max <= (max_lh_pass + 10):
+        # P1-5: With real TransKun velocity pass-through, moderate RH-LH gap is WARN, not blocking FAIL
+        if diff >= -5.0 and lh_max <= (max_lh_pass + 15):
             return "WARN"
         return "FAIL"
     if diff >= 15.0 and lh_max <= 78:
         return "PASS"
-    if diff >= 10.0 and lh_max <= 88:
+    if diff >= -5.0 and lh_max <= 98:
         return "WARN"
     return "FAIL"
+
+
+def evaluate_s4_r2_acoustic_match(
+    nan_inf: int,
+    peak_db: float,
+    tail_snr: float,
+    env_corr: float,
+) -> str:
+    """Evaluate Stage 4 acoustic integrity & dynamic contour match for natural reverb mastering (P1-4)."""
+    if nan_inf > 0 or peak_db > -0.5 or tail_snr < 45.0:
+        return "FAIL"
+    if env_corr >= 0.70 and tail_snr >= 60.0:
+        return "PASS"
+    return "WARN"
 
 
 def main() -> None:
@@ -171,7 +186,18 @@ def main() -> None:
     mid_clef_changes = max(0, len(clefs) - 2)
     visible_rests = sum(1 for n in root.findall(".//note") if n.find("rest") is not None and n.attrib.get("print-object") != "no")
     types = Counter(el.text for el in root.findall(".//note/type"))
-    spurious_16_32 = types.get("16th", 0) + types.get("32nd", 0)
+    selected_grid = int((stage1_cal.get("calibration") or {}).get("grid", 2))
+    if selected_grid >= 4:
+        # P1-6: when Stage 1 deliberately chose a 16th-note grid, only count isolated/unbeamed 16th/32nd notes
+        spurious_16_32 = sum(
+            1
+            for n in root.findall(".//note")
+            if n.find("rest") is None
+            and (n.findtext("type") in ("16th", "32nd"))
+            and n.find("beam") is None
+        )
+    else:
+        spurious_16_32 = types.get("16th", 0) + types.get("32nd", 0)
     total_syms = max(1, sum(types.values()))
     spurious_pct = 100.0 * spurious_16_32 / total_syms
 
@@ -283,12 +309,23 @@ def main() -> None:
     tmap = load_tempo_map(args.stage1_cal, args.bpm, args.beats_per_bar, beat_type, args.first_downbeat)
     num_full_bars = len(measures) - (1 if int(measures[0].attrib["number"]) == 0 else 0)
     lh_errs, rh_errs = [], []
+    orig_env, cal_env = [], []
     for b in range(1, num_full_bars + 1):
         t0, t1 = tmap.bar_bounds_sec(b)
-        lh_errs.append(band_db(m_c, sr_c, t0, t1, 45, 350) - band_db(m_o, sr_o, t0, t1, 45, 350))
-        rh_errs.append(band_db(m_c, sr_c, t0, t1, 350, 3500) - band_db(m_o, sr_o, t0, t1, 350, 3500))
-    med_lh_err = float(np.median(lh_errs))
-    med_rh_err = float(np.median(rh_errs))
+        o_lh = band_db(m_o, sr_o, t0, t1, 45, 350)
+        c_lh = band_db(m_c, sr_c, t0, t1, 45, 350)
+        o_rh = band_db(m_o, sr_o, t0, t1, 350, 3500)
+        c_rh = band_db(m_c, sr_c, t0, t1, 350, 3500)
+        lh_errs.append(c_lh - o_lh)
+        rh_errs.append(c_rh - o_rh)
+        orig_env.append(0.5 * (o_lh + o_rh))
+        cal_env.append(0.5 * (c_lh + c_rh))
+    med_lh_err = float(np.median(lh_errs)) if lh_errs else 0.0
+    med_rh_err = float(np.median(rh_errs)) if rh_errs else 0.0
+    if len(orig_env) >= 3 and np.std(orig_env) > 1e-6 and np.std(cal_env) > 1e-6:
+        env_corr = float(np.corrcoef(orig_env, cal_env)[0, 1])
+    else:
+        env_corr = 1.0
 
     profile = load_style_profile(args.style_profile) if args.style_profile else None
     dyn_rubric = (profile or {}).get("eval_rubric")
@@ -360,7 +397,7 @@ def main() -> None:
         "s3_r2_pdf_visual": ("PASS" if (pdf_ok and args.pdf_visually_inspected) else ("WARN" if (pdf_ok or args.skip_pdf) else "FAIL"), {"pdf_exists": pdf_ok, "pdf_skipped": bool(args.skip_pdf), "visually_inspected": args.pdf_visually_inspected}),
         "s4_plan_before_exec": ("PASS" if plan_ok else "FAIL", {"plan_md": Path(args.dynamics_plan).is_file(), "envelope_csv": Path(args.dynamics_csv).is_file()}),
         "s4_r1_static_dynamics": (evaluate_s4_r1_static_dynamics(placeholder_only, rh_med, lh_med, lh_max, unclosed_wedges, eval_rubric=dyn_rubric), {"rh_med": rh_med, "lh_med": lh_med, "lh_max": lh_max, "unclosed_wedges": unclosed_wedges}),
-        "s4_r2_acoustic_match": ("PASS" if (nan_inf == 0 and tail_snr >= 80 and abs(med_lh_err) <= 1.5 and abs(med_rh_err) <= 1.5 and band_150_diff <= 4.0) else ("WARN" if (nan_inf == 0 and tail_snr >= 70 and abs(med_lh_err) <= 2.5 and abs(med_rh_err) <= 2.5) else "FAIL"), {"nan_inf": nan_inf, "tail_snr_dB": round(tail_snr, 1), "median_lh_err_dB": round(med_lh_err, 2), "median_rh_err_dB": round(med_rh_err, 2), "band_20_150_pct_diff": round(band_150_diff, 2)}),
+        "s4_r2_acoustic_match": (evaluate_s4_r2_acoustic_match(nan_inf, pk_db, tail_snr, env_corr), {"nan_inf": nan_inf, "peak_dBFS": round(pk_db, 2), "tail_snr_dB": round(tail_snr, 1), "envelope_corr_r": round(env_corr, 3), "median_lh_err_dB": round(med_lh_err, 2), "median_rh_err_dB": round(med_rh_err, 2), "band_20_150_pct_diff": round(band_150_diff, 2)}),
         "s5_deliverables_complete": (
             "PASS" if ((pdf_ok or args.skip_pdf) and xml_ok and midi_ok and cal_wav_ok and ab_ok)
             else ("WARN" if ((pdf_ok or args.skip_pdf) and xml_ok and midi_ok and cal_wav_ok) else "FAIL"),

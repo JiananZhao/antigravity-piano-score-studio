@@ -304,6 +304,9 @@ def main() -> None:
                 "--out",
                 str(pitch_audit_json),
             ]
+            raw_mid_for_s2 = manifest["artifacts"].get("score_raw_mid")
+            if raw_mid_for_s2 and Path(raw_mid_for_s2).is_file():
+                s2_cmd.extend(["--raw-midi", str(raw_mid_for_s2)])
             if baseline_xml and Path(baseline_xml).is_file():
                 s2_cmd.extend(["--xml", str(baseline_xml)])
             _run_step("Stage 2: Harmonic Pitch Audit & Ghost Cleaning", s2_cmd)
