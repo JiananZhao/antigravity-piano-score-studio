@@ -1,6 +1,6 @@
 """Stage 4.2-4.4: Generalized two-band LH/RH velocity calibration, CC64 pedaling,
 Salamander Grand Piano rendering (sfizz_render CLI or music-learning NativeHost),
-natural stereo concert-hall reverb, and transparent loudness-aligned mastering.
+and closed-loop two-band acoustic mastering.
 """
 
 from __future__ import annotations
@@ -415,7 +415,7 @@ def main() -> None:
     ap.add_argument("--key-fifths", type=int, default=-2)
     ap.add_argument("--song-name", default="PianoPiece")
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
-    ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities and CC64 pedaling")
+    ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities for touch fusion")
     ap.add_argument("--config", default=None)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
@@ -513,12 +513,19 @@ def main() -> None:
     print(f"Stage 4 Round 1 Static Check: RH_med={rh_med:.1f}, LH_med={lh_med:.1f}, LH_max={lh_max}")
 
     rate = 48000
-    for m in range(0, max_bar + 1):
-        _, b_end = tmap.bar_bounds_sec(m)
-        m_lh = sorted([n for n in lh_all if n["measure"] == m], key=lambda x: x["st"])
-        for i, n in enumerate(m_lh):
-            nxt = [o["st"] for o in m_lh[i + 1 :] if o["pitch"] == n["pitch"]]
-            n["et"] = max(n["et"], (nxt[0] - 0.020) if nxt else (b_end - 0.015))
+    _, t_end = tmap.bar_bounds_sec(max_bar)
+    real_pedals: list[dict] = []
+    if pedal_style != "dry_articulated" and args.transkun_midi and Path(args.transkun_midi).is_file():
+        real_pedals = read_midi_pedal_events(Path(args.transkun_midi), rate=rate)
+
+    # P1-10: only stretch LH notes to bar end for legato styles when synthetic pedaling is used
+    if pedal_style in ("legato_harmonic", "romantic_rubato") and len(real_pedals) < 2:
+        for m in range(0, max_bar + 1):
+            _, b_end = tmap.bar_bounds_sec(m)
+            m_lh = sorted([n for n in lh_all if n["measure"] == m], key=lambda x: x["st"])
+            for i, n in enumerate(m_lh):
+                nxt = [o["st"] for o in m_lh[i + 1 :] if o["pitch"] == n["pitch"]]
+                n["et"] = max(n["et"], (nxt[0] - 0.020) if nxt else (b_end - 0.015))
 
     render_notes, clusters = [], []
     for n in sorted(notes, key=lambda x: (x["st"], x["pitch"])):
@@ -535,11 +542,6 @@ def main() -> None:
             st = n["st"] + (idx * step if len(cl) > 1 else 0.0)
             dur = max(0.14, n["et"] - st) * (0.98 if n["staff"] == 1 else 1.0)
             render_notes.append({"sample": max(0, int(round(st * rate))), "duration_samples": int(round(dur * rate)), "note": n["pitch"], "velocity": round(n.get("calc_vel", 64) / 127.0, 4), "channel": 1, "staff": n["staff"]})
-
-    _, t_end = tmap.bar_bounds_sec(max_bar)
-    real_pedals: list[dict] = []
-    if pedal_style != "dry_articulated" and args.transkun_midi and Path(args.transkun_midi).is_file():
-        real_pedals = read_midi_pedal_events(Path(args.transkun_midi), rate=rate)
     if len(real_pedals) >= 2:
         controllers = real_pedals + [
             {"sample": max(0, int(round((t_end + 0.15) * rate))), "channel": 1, "controller": 64, "value": 0}

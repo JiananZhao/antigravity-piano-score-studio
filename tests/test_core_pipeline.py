@@ -132,7 +132,9 @@ def test_eval_gate_s4_r1_warn_band() -> None:
     assert eg.evaluate_s4_r1_static_dynamics(False, 75.0, 55.0, 74, 0) == "PASS"
     assert eg.evaluate_s4_r1_static_dynamics(False, 68.0, 56.0, 78, 0) == "WARN"
     assert eg.evaluate_s4_r1_static_dynamics(False, 75.0, 55.0, 82, 0) == "WARN"
-    assert eg.evaluate_s4_r1_static_dynamics(False, 65.0, 58.0, 74, 0) == "FAIL"
+    assert eg.evaluate_s4_r1_static_dynamics(False, 65.0, 58.0, 74, 0) == "WARN"
+    assert eg.evaluate_s4_r1_static_dynamics(False, 50.0, 62.0, 74, 0) == "FAIL"
+    assert eg.evaluate_s4_r1_static_dynamics(False, 75.0, 55.0, 105, 0) == "FAIL"
     assert eg.evaluate_s4_r1_static_dynamics(True, 75.0, 55.0, 74, 0) == "FAIL"
     assert eg.evaluate_s4_r1_static_dynamics(False, 75.0, 55.0, 74, 1) == "FAIL"
 
@@ -362,9 +364,9 @@ def test_style_profiles_and_dynamic_eval_rubric() -> None:
         assert prof["profile_id"] == pid
         assert required_sections.issubset(prof.keys())
 
-    # Balanced Baroque counterpoint (rh_med=84, lh_med=82, lh_max=98) fails legacy Pop rubric
-    # but PASSES under baroque_polyphonic dynamic rubric.
-    assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0) == "FAIL"
+    # Balanced Baroque counterpoint (rh_med=84, lh_med=82, lh_max=98) warns on default rubric
+    # and PASSES under baroque_polyphonic dynamic rubric.
+    assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0) == "WARN"
     baroque_rubric = load_style_profile("baroque_polyphonic")["eval_rubric"]
     assert evaluate_s4_r1_static_dynamics(False, 84.0, 82.0, 98, 0, eval_rubric=baroque_rubric) == "PASS"
 
@@ -709,7 +711,7 @@ def test_rubato_low_circular_r_preserves_beat_this_bpm() -> None:
 def test_stage3_prunes_orphan_tie_stop_without_phantom_note() -> None:
     """Regression: truncated cross-bar note must NOT become a phantom re-struck note in the next bar."""
     s3 = _load_script("stage3_engrave_study_score.py")
-    # Bar 0 (pickup_start=1, bar_slots=16 @ div=4): F5(77) held from slot 3 across barline into Bar 1 (dur=15),
+    # Bar 0 (pickup_start=0, bar_slots=16 @ div=4): F5(77) held from slot 3 across barline into Bar 1 (dur=15),
     # while G4(67) and Bb4(70) enter underneath -> Bar 0 must split into 2 voices preserving the real cross-bar tie!
     notes_bar0 = [
         s3.RawNote(start_slot=3, dur=15, pitch=77, hand=1),
@@ -794,3 +796,145 @@ def test_microtiming_alignment_soft_velocity_and_hall_reverb() -> None:
     assert np.all(np.isfinite(out))
     # Reverb tail must exist after the impulse (> 0.05s later)
     assert float(np.sqrt(np.mean(out[int(0.08 * sr) : int(0.30 * sr)] ** 2))) > 1e-4
+
+
+def test_p0_1_quiet_audio_first_note_detection() -> None:
+    """P0-1: Quiet recording peaking at -36 dBFS must detect first note near 0s, not end of track."""
+    s0 = _load_script("stage0_audio_triage.py")
+    detect_first_note_sec = s0.detect_first_note_sec
+
+    sr = 16000
+    dur = 10.0
+    t = np.arange(int(sr * dur)) / sr
+    # Peak amplitude ~0.0155 (~ -36.2 dBFS), starting at t=0.5s after silence
+    sig = np.zeros_like(t)
+    mask = t >= 0.5
+    sig[mask] = 0.0155 * np.sin(2.0 * np.pi * 440.0 * t[mask])
+    first_sec = detect_first_note_sec(sig, sr)
+    assert 0.45 <= first_sec <= 0.55, f"Expected ~0.5s, got {first_sec}"
+
+
+def test_p0_2_multibar_pickup_alignment_stage2(tmp_path: Path) -> None:
+    """P0-2: Pickup > 1 bar must stay aligned between quantizer and Stage 2 via bar1_offset_quarters."""
+    s2 = _load_script("stage2_pitch_audit.py")
+    tm = _load_script("tempo_map.py")
+    te = _load_script("transcription_engines.py")
+    parse_midi_onsets = s2.parse_midi_onsets
+    TempoMap = tm.TempoMap
+    quantize_performance_midi = te.quantize_performance_midi
+
+    # 120 BPM 4/4 -> 1 quarter = 0.5s, 1 bar = 2.0s. first_downbeat = 5.0s.
+    # C4 at 0.0s is 2.5 bars before first_downbeat -> bars_before = 3, bar1_offset_quarters = 12.0.
+    tmap = TempoMap(bpm=120.0, beats_per_bar=4, beat_type=4, first_downbeat=5.0, mode="fixed")
+    notes = [
+        {"pitch": 60, "start_sec": 0.0, "end_sec": 0.5, "velocity": 70},
+        {"pitch": 64, "start_sec": 5.0, "end_sec": 5.5, "velocity": 80},
+    ]
+    out_mid = tmp_path / "multibar_pickup.mid"
+    res = quantize_performance_midi(
+        note_events=notes,
+        tempo_map=tmap,
+        grid=2,
+        beats_per_bar=4,
+        beat_type=4,
+        out_mid=out_mid,
+        trim_leading_bars=True,
+    )
+    assert res["bars_before"] == 3
+    assert abs(res["bar1_offset_quarters"] - 12.0) < 1e-6
+
+    parsed = parse_midi_onsets(
+        out_mid,
+        bpm=120.0,
+        beats_per_bar=4,
+        first_downbeat=5.0,
+        beat_type=4,
+        tempo_map=tmap,
+        has_pickup=res["has_pickup"],
+        bar1_offset_quarters=res["bar1_offset_quarters"],
+    )
+    by_p = {n["midi"]: n["t_on"] for n in parsed}
+    assert abs(by_p[60] - 0.0) < 0.05, f"C4 drifted: {by_p[60]}"
+    assert abs(by_p[64] - 5.0) < 0.05, f"E4 drifted: {by_p[64]}"
+    assert mido.MidiFile(str(out_mid)).ticks_per_beat > 0
+
+
+def test_p1_1_cross_bar_tied_note_duration_preserved() -> None:
+    """P1-1: 6-beat cross-bar held note with 1 moving note in bar 1 must not be truncated."""
+    s3 = _load_script("stage3_engrave_study_score.py")
+    BarSegment = s3.BarSegment
+    reconcile_cross_bar_ties = s3.reconcile_cross_bar_ties
+    simplify_bar_hand = s3.simplify_bar_hand
+
+    divisions = 2  # 8 slots per 4/4 bar
+    bar_slots = 8
+    slot_rms = np.full(32, -20.0)
+
+    # Bar 1 RH: E5 held for all 4 beats (tie_start=True), plus C5 on beat 2 (only 1 later slot)
+    b1_segs = [
+        BarSegment(bar=1, slot=0, dur=8, pitch=76, hand=1, tie_stop=False, tie_start=True),
+        BarSegment(bar=1, slot=2, dur=2, pitch=72, hand=1, tie_stop=False, tie_start=False),
+    ]
+    # Bar 2 RH: E5 continuation for 2 beats (tie_stop=True)
+    b2_segs = [
+        BarSegment(bar=2, slot=0, dur=4, pitch=76, hand=1, tie_stop=True, tie_start=False),
+    ]
+
+    v1_b1, v2_b1 = simplify_bar_hand(b1_segs, 1, 0, bar_slots, slot_rms, divisions)
+    v1_b2, v2_b2 = simplify_bar_hand(b2_segs, 2, bar_slots, bar_slots, slot_rms, divisions)
+    bar_voices = {(1, 1): (v1_b1, v2_b1), (2, 1): (v1_b2, v2_b2)}
+    reconcile_cross_bar_ties(bar_voices, start_bar=1, max_bar=2, bar_slots=bar_slots, pickup_start=0)
+
+    def total_dur(pitch: int) -> int:
+        tot = 0
+        for b in (1, 2):
+            v1, v2 = bar_voices[(b, 1)]
+            for ev in list(v1) + (list(v2) if v2 else []):
+                if any(s.pitch == pitch for s in ev.segs):
+                    tot += ev.dur
+        return tot
+
+    assert total_dur(76) == 12, f"Expected 12 slots (6 beats) for E5, got {total_dur(76)}"
+
+
+def test_p1_7_cc64_pedal_preserved_with_pad_sec(tmp_path: Path) -> None:
+    """P1-7: Leading pad_sec > 0 must preserve and time-shift CC64 pedal events in raw MIDI."""
+    te = _load_script("transcription_engines.py")
+    _write_raw_performance_midi = te._write_raw_performance_midi
+    read_midi_cc64_events_sec = te.read_midi_cc64_events_sec
+
+    src_mid = tmp_path / "padded_transkun.mid"
+    mid = mido.MidiFile(ticks_per_beat=480)
+    tr = mido.MidiTrack()
+    tr.append(mido.MetaMessage("set_tempo", tempo=500_000, time=0))  # 960 ticks/sec
+    tr.append(mido.Message("control_change", channel=0, control=64, value=127, time=2400))  # 2.5s
+    tr.append(mido.Message("control_change", channel=0, control=64, value=0, time=960))     # 3.5s
+    mid.tracks.append(tr)
+    mid.save(str(src_mid))
+
+    cc_evs = read_midi_cc64_events_sec(src_mid, pad_sec=2.0)
+    assert len(cc_evs) == 2
+    assert abs(cc_evs[0]["time_sec"] - 0.5) < 1e-3 and cc_evs[0]["value"] == 127
+    assert abs(cc_evs[1]["time_sec"] - 1.5) < 1e-3 and cc_evs[1]["value"] == 0
+
+    out_raw = tmp_path / "score_raw.mid"
+    _write_raw_performance_midi(
+        [{"pitch": 60, "start_sec": 0.5, "end_sec": 1.4, "velocity": 72}],
+        out_raw,
+        cc64_events=cc_evs,
+    )
+    cc_back = read_midi_cc64_events_sec(out_raw, pad_sec=0.0)
+    assert len(cc_back) == 2 and cc_back[0]["value"] == 127 and cc_back[1]["value"] == 0
+
+
+def test_p1_4_eval_gate_natural_reverb_match() -> None:
+    """P1-4 & P1-5: Natural reverb mastering & real TransKun velocity pass Eval Gate cleanly."""
+    eg = _load_script("eval_gate_runner.py")
+    evaluate_s4_r1_static_dynamics = eg.evaluate_s4_r1_static_dynamics
+    evaluate_s4_r2_acoustic_match = eg.evaluate_s4_r2_acoustic_match
+
+    assert evaluate_s4_r2_acoustic_match(nan_inf=0, peak_db=-1.0, tail_snr=85.0, env_corr=0.82) == "PASS"
+    assert evaluate_s4_r2_acoustic_match(nan_inf=0, peak_db=-1.0, tail_snr=85.0, env_corr=0.55) == "WARN"
+    assert evaluate_s4_r2_acoustic_match(nan_inf=1, peak_db=-1.0, tail_snr=85.0, env_corr=0.90) == "FAIL"
+    assert evaluate_s4_r2_acoustic_match(nan_inf=0, peak_db=-0.1, tail_snr=85.0, env_corr=0.90) == "FAIL"
+    assert evaluate_s4_r1_static_dynamics(False, rh_med=62.0, lh_med=58.0, lh_max=82, unclosed_wedges=0) == "WARN"

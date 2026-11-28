@@ -199,9 +199,13 @@ def quantize_performance_midi(
 
     out_mid.parent.mkdir(parents=True, exist_ok=True)
     mid.save(str(out_mid))
+    bar1_offset_quarters = round(float(slot_offset) / float(grid), 6) if grid > 0 else 0.0
+    bars_before_out = int(round(slot_offset / float(bar_slots))) if (slot_offset > 0 and bar_slots > 0) else 0
     return {
         "note_count": len(quantized),
         "slot_offset": slot_offset,
+        "bars_before": bars_before_out,
+        "bar1_offset_quarters": bar1_offset_quarters,
         "has_pickup": min_slot < 0,
         "quantized_midi": str(out_mid),
     }
@@ -257,15 +261,71 @@ def run_transkun_transcribe(
             raise RuntimeError(f"TransKun v2 transcription failed: {proc.stderr or proc.stdout}")
 
         notes = read_midi_note_events_sec(tmp_mid, pad_sec=pad_sec)
-        # Save raw performance MIDI (shifted if padded, or verbatim if pad_sec == 0)
+        # Save raw performance MIDI (shifted with CC64 pedals preserved if padded, or verbatim if pad_sec == 0)
         if pad_sec <= 0.0:
             out_raw_mid.write_bytes(tmp_mid.read_bytes())
         else:
-            _write_raw_performance_midi(notes, out_raw_mid)
+            cc64_events = read_midi_cc64_events_sec(tmp_mid, pad_sec=pad_sec)
+            _write_raw_performance_midi(notes, out_raw_mid, cc64_events=cc64_events)
         return notes
 
 
-def _write_raw_performance_midi(notes: list[dict], out_mid: Path) -> None:
+def read_midi_cc64_events_sec(midi_path: Path, pad_sec: float = 0.0) -> list[dict]:
+    """Extract CC64 sustain pedal events in wall-clock seconds, subtracting leading pad_sec (P1-7)."""
+    mid = mido.MidiFile(str(midi_path))
+    tpb = max(1, int(mid.ticks_per_beat))
+    tempo_events: list[tuple[int, int]] = []
+    for tr in mid.tracks:
+        tk = 0
+        for msg in tr:
+            tk += msg.time
+            if msg.type == "set_tempo":
+                tempo_events.append((tk, int(msg.tempo)))
+    tempo_events.sort(key=lambda x: x[0])
+
+    def tick_to_sec(target_tick: int) -> float:
+        sec = 0.0
+        cur_tk = 0
+        cur_tempo = 500_000
+        for t_tk, tmp in tempo_events:
+            if t_tk >= target_tick:
+                break
+            if t_tk > cur_tk:
+                sec += mido.tick2second(t_tk - cur_tk, tpb, cur_tempo)
+                cur_tk = t_tk
+            cur_tempo = tmp
+        if target_tick > cur_tk:
+            sec += mido.tick2second(target_tick - cur_tk, tpb, cur_tempo)
+        return sec
+
+    raw_cc: list[tuple[float, int]] = []
+    for tr in mid.tracks:
+        tk = 0
+        for msg in tr:
+            tk += msg.time
+            if msg.type == "control_change" and msg.control == 64:
+                raw_cc.append((tick_to_sec(tk), int(msg.value)))
+    raw_cc.sort(key=lambda x: x[0])
+
+    out: list[dict] = []
+    initial_val: int | None = None
+    for t_sec, val in raw_cc:
+        t_adj = t_sec - pad_sec
+        if t_adj < 0.0:
+            initial_val = val
+        else:
+            out.append({"time_sec": round(t_adj, 5), "value": val})
+    if initial_val is not None and initial_val > 0:
+        if not out or out[0]["time_sec"] > 0.0:
+            out.insert(0, {"time_sec": 0.0, "value": initial_val})
+    return out
+
+
+def _write_raw_performance_midi(
+    notes: list[dict],
+    out_mid: Path,
+    cc64_events: list[dict] | None = None,
+) -> None:
     """Write unquantized performance MIDI in real seconds (120 BPM reference, 960 ticks/sec)."""
     tpb = 480
     mid = mido.MidiFile(ticks_per_beat=tpb)
@@ -275,22 +335,28 @@ def _write_raw_performance_midi(notes: list[dict], out_mid: Path) -> None:
     tr.append(mido.Message("program_change", channel=0, program=0, time=0))
 
     ticks_per_sec = 960.0
+    # kind: 0=cc64, 1=note_off, 2=note_on
     evs: list[tuple[int, int, int, int]] = []
     for n in notes:
         tk_on = max(0, int(round(n["start_sec"] * ticks_per_sec)))
         tk_off = max(tk_on + 1, int(round(n["end_sec"] * ticks_per_sec)))
-        evs.append((tk_on, 1, n["pitch"], n["velocity"]))
-        evs.append((tk_off, 0, n["pitch"], 0))
+        evs.append((tk_on, 2, n["pitch"], n["velocity"]))
+        evs.append((tk_off, 1, n["pitch"], 0))
+    for cc in (cc64_events or []):
+        tk_cc = max(0, int(round(float(cc["time_sec"]) * ticks_per_sec)))
+        evs.append((tk_cc, 0, 64, max(0, min(127, int(cc["value"])))))
     evs.sort(key=lambda x: (x[0], x[1], x[2]))
 
     cur_tk = 0
-    for tk, kind, pitch, vel in evs:
+    for tk, kind, p1, p2 in evs:
         dt = max(0, tk - cur_tk)
         cur_tk = tk
-        if kind == 1:
-            tr.append(mido.Message("note_on", channel=0, note=pitch, velocity=vel, time=dt))
+        if kind == 0:
+            tr.append(mido.Message("control_change", channel=0, control=p1, value=p2, time=dt))
+        elif kind == 2:
+            tr.append(mido.Message("note_on", channel=0, note=p1, velocity=p2, time=dt))
         else:
-            tr.append(mido.Message("note_off", channel=0, note=pitch, velocity=0, time=dt))
+            tr.append(mido.Message("note_off", channel=0, note=p1, velocity=0, time=dt))
     tr.append(mido.MetaMessage("end_of_track", time=tpb))
     mid.tracks.append(tr)
     out_mid.parent.mkdir(parents=True, exist_ok=True)
