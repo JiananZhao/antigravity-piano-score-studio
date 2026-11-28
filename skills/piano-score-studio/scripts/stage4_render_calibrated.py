@@ -24,6 +24,15 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tempo_map import TempoMap, load_tempo_map
 from style_analyzer import load_style_profile
+from audio_match import (
+    apply_eq_fft,
+    apply_peak_limiter,
+    design_match_eq,
+    detect_sound_end,
+    estimate_decay_rate,
+    integrated_lufs,
+    long_term_spectrum_db,
+)
 from pedal_and_velocity import (
     align_microtiming_to_transkun,
     build_performance_notes_from_raw_midi,
@@ -34,6 +43,8 @@ from pedal_and_velocity import (
     load_confirmed_ghosts_from_audit,
     read_midi_pedal_events,
     read_midi_performance_events,
+    read_midi_soft_pedal_events,
+    read_midi_soft_pedal_spans,
 )
 
 STEP_MAP = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
@@ -448,6 +459,8 @@ def main() -> None:
     ap.add_argument("--style-profile", default=None, help="Optional v3.0 style profile JSON or ID")
     ap.add_argument("--transkun-midi", default=None, help="Optional Stage 1 MIDI with real TransKun velocities for touch fusion")
     ap.add_argument("--pitch-audit", default=None, help="Optional Stage 2 pitch_audit.json for confirmed ghost removal on raw performance MIDI")
+    ap.add_argument("--match-eq", default="on", choices=("on", "off"), help="Apply smooth 1/3-octave match EQ toward original timbre")
+    ap.add_argument("--eq-strength", type=float, default=0.7, help="Match EQ strength (0.0..1.0; raised to 0.85 when CC67 soft-pedal ratio >= 0.3)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--out-dir", required=True)
     args = ap.parse_args()
@@ -457,7 +470,9 @@ def main() -> None:
 
     orig_d, sr_orig = sf.read(args.orig_audio, dtype="float64", always_2d=True)
     mono_orig = orig_d.mean(axis=1)
-    target_rms_db = max(-26.0, min(-14.0, 20.0 * np.log10(float(np.sqrt(np.mean(mono_orig ** 2))) + 1e-12)))
+    lufs_orig = integrated_lufs(orig_d, sr_orig)
+    target_lufs = float(np.clip(lufs_orig, -24.0, -10.0))
+    orig_sound_end = detect_sound_end(orig_d, sr_orig, floor_db=-60.0)
 
     fft_full = np.fft.rfft(mono_orig)
     freqs_o = np.fft.rfftfreq(len(mono_orig), 1.0 / sr_orig)
@@ -541,6 +556,8 @@ def main() -> None:
                 tempo_map=tmap,
                 confirmed_ghosts=confirmed_ghosts,
                 max_bar=max_bar,
+                rh_cap=94,
+                lh_cap=min(90, lh_ceiling_vel),
             )
             if perf_notes:
                 notes = perf_notes
@@ -614,12 +631,27 @@ def main() -> None:
                 )
         return built
 
+    soft_pedal_events: list[dict] = []
+    soft_pedal_spans: list[tuple[float, float]] = []
+    if args.transkun_midi and Path(args.transkun_midi).is_file():
+        soft_pedal_events = read_midi_soft_pedal_events(Path(args.transkun_midi), rate=rate)
+        soft_pedal_spans = read_midi_soft_pedal_spans(Path(args.transkun_midi))
+    orig_dur_sec = max(orig_sound_end, len(orig_d) / float(sr_orig), 1e-3)
+    soft_ratio = float(sum(max(0.0, b - a) for a, b in soft_pedal_spans) / orig_dur_sec)
+
+    last_real_cc64_t = max((c["sample"] / float(rate) for c in real_pedals), default=0.0)
+    pedal_release_t = max(t_end + 0.15, last_real_cc64_t, orig_sound_end - 0.5)
+    render_total_samples = int(round((max(t_end, orig_sound_end) + 4.0) * rate))
+
     render_notes = _build_render_notes(notes)
     if len(real_pedals) >= 2:
         controllers = real_pedals + [
-            {"sample": max(0, int(round((t_end + 0.15) * rate))), "channel": 1, "controller": 64, "value": 0}
+            {"sample": max(0, int(round(pedal_release_t * rate))), "channel": 1, "controller": 64, "value": 0}
         ]
-        print(f"Stage 4 Pedaling: using {len(real_pedals)} real CC64 events from {Path(args.transkun_midi).name}")
+        print(
+            f"Stage 4 Pedaling: using {len(real_pedals)} real CC64 events from {Path(args.transkun_midi).name} "
+            f"(final release @ {pedal_release_t:.2f}s)"
+        )
     else:
         controllers = compute_dynamic_pedal_events(
             notes,
@@ -629,44 +661,112 @@ def main() -> None:
             pedal_style=pedal_style,
             beats_per_bar=args.beats_per_bar,
             beat_type=beat_type,
+            release_t=pedal_release_t,
         )
+    if soft_pedal_events:
+        controllers = controllers + soft_pedal_events
+        print(f"Stage 4 Soft Pedal: preserved {len(soft_pedal_events)} CC67 events (soft_ratio={soft_ratio:.2f})")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mid_out = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.mid"
     export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out, tempo_map=tmap)
 
+    effective_lh_cap = min(90, lh_ceiling_vel)
+    adj_cnt = 0
+    med_err_db = 0.0
     with tempfile.TemporaryDirectory() as tmpd:
         raw_wav = Path(tmpd) / "raw_pass1.wav"
-        render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav, rate, int(round(t_end * rate)) + rate * 4)
-        sig, sr = sf.read(str(raw_wav))
-        mono_pass1 = sig.mean(axis=1) if sig.ndim == 2 else sig
-        adj_cnt, med_err_db = closed_loop_velocity_calibration(notes, mono_orig, sr_orig, mono_pass1, sr)
+        render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav, rate, render_total_samples)
+        sig_2d, sr = sf.read(str(raw_wav), dtype="float64", always_2d=True)
+        adj_cnt, med_err_db = closed_loop_velocity_calibration(
+            notes, orig_d, sr_orig, sig_2d, sr, rh_cap=94, lh_cap=effective_lh_cap
+        )
         if adj_cnt > 0:
             print(
-                f"Stage 4 Closed-Loop Acoustic Calibration: adjusted {adj_cnt}/{len(notes)} notes "
-                f"(Pass-1 median |err|={med_err_db:.2f} dB); rendering Pass 2..."
+                f"Stage 4 Closed-Loop Stereo Acoustic Calibration: adjusted {adj_cnt}/{len(notes)} notes "
+                f"(Pass-1 median |err|={med_err_db:.2f} dB, caps RH=94/LH={effective_lh_cap}); rendering Pass 2..."
             )
             render_notes = _build_render_notes(notes)
             export_midi(render_notes, controllers, rate, args.bpm, args.beats_per_bar, beat_type, args.key_fifths, mid_out, tempo_map=tmap)
             raw_wav_p2 = Path(tmpd) / "raw_pass2.wav"
-            render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav_p2, rate, int(round(t_end * rate)) + rate * 4)
-            sig, sr = sf.read(str(raw_wav_p2))
+            render_with_sfizz_or_native(plugin_root, cfg, render_notes, controllers, mid_out, raw_wav_p2, rate, render_total_samples)
+            sig_2d, sr = sf.read(str(raw_wav_p2), dtype="float64", always_2d=True)
 
-    # Preserve natural Salamander Grand Piano timbre & dynamics:
-    # Add gentle stereo concert-hall reverb + transparent whole-song RMS loudness alignment
-    # + -1.0 dBFS peak ceiling (no hard-coded EQ colorization and no 30ms envelope pumping).
-    reverb_wet = 0.06 if pedal_style == "dry_articulated" else 0.18
-    final_sig = apply_natural_hall_reverb(sig, sr, wet_mix=reverb_wet, rt60_sec=2.0)
-    n_smp = len(final_sig)
-    dar = min(n_smp, max(1, int(t_end * sr)))
-    rms_cur = float(np.sqrt(np.mean(final_sig[:dar] ** 2)))
-    if rms_cur > 1e-9:
-        final_sig *= (10.0 ** (target_rms_db / 20.0)) / rms_cur
-    ceil = 10.0 ** (-1.0 / 20.0)
-    peak = float(np.max(np.abs(final_sig))) if n_smp else 0.0
-    if peak > ceil:
-        final_sig *= ceil / peak
+    # Adaptive 1/3-octave match EQ (before reverb so hall tail matches original tonal warmth)
+    eq_strength = float(args.eq_strength)
+    if soft_ratio >= 0.3 and abs(eq_strength - 0.7) < 1e-6:
+        eq_strength = 0.85
+    eq_bands_hz: list[float] = []
+    eq_gains_db_list: list[float] = []
+    sig_eq = sig_2d
+    if args.match_eq == "on":
+        b_o, spec_o = long_term_spectrum_db(orig_d, sr_orig)
+        b_r, spec_r = long_term_spectrum_db(sig_2d, sr)
+        n_common = min(len(b_o), len(b_r))
+        eq_bands = b_o[:n_common]
+        eq_gains = design_match_eq(spec_o[:n_common], spec_r[:n_common], band_freqs=eq_bands, strength=eq_strength)
+        sig_eq = apply_eq_fft(sig_2d, sr, eq_bands, eq_gains)
+        eq_bands_hz = [round(float(f), 2) for f in eq_bands]
+        eq_gains_db_list = [round(float(g), 3) for g in eq_gains]
+        print(
+            f"Stage 4 Adaptive Match EQ: strength={eq_strength:.2f} (soft_ratio={soft_ratio:.2f}), "
+            f"gain range [{min(eq_gains_db_list):.1f}, {max(eq_gains_db_list):+.1f}] dB"
+        )
+
+    # Adaptive RT60 estimation from original ending chord decay
+    last_note_on = max((float(n["st"]) for n in notes), default=0.0)
+    decay_orig = estimate_decay_rate(orig_d, sr_orig, last_note_on + 0.2, orig_sound_end, band=(400.0, 1500.0))
+    decay_rate_orig_db_s: float | None = None
+    rt60_est: float | None = None
+    if decay_orig is not None:
+        decay_rate_orig_db_s = float(decay_orig[0])
+        rt60_est = 60.0 / abs(decay_rate_orig_db_s)
+        rt60_used = float(np.clip(rt60_est, 1.2, 6.0))
+    else:
+        rt60_used = 2.0
+    reverb_wet = (
+        0.06
+        if pedal_style == "dry_articulated"
+        else float(np.clip(0.18 + 0.04 * (rt60_used - 2.0), 0.12, 0.35))
+    )
+    print(f"Stage 4 Adaptive Reverb: rt60_est={rt60_est}, rt60_used={rt60_used:.2f}s, wet_mix={reverb_wet:.3f}")
+    min_reverb_samples = int(round((orig_sound_end + 1.5 + rt60_used) * sr))
+    if len(sig_eq) < min_reverb_samples:
+        sig_eq = np.pad(sig_eq, ((0, min_reverb_samples - len(sig_eq)), (0, 0)), mode="constant")
+    final_sig = apply_natural_hall_reverb(sig_eq, sr, wet_mix=reverb_wet, rt60_sec=rt60_used)
+
+    # Stereo LUFS alignment + lookahead peak limiter (up to 2 rounds, no whole-track peak crush)
+    dar = min(len(final_sig), max(1, int(round(orig_sound_end * sr))))
+    limiter_max_gr_db = 0.0
+    lufs_render = integrated_lufs(final_sig[:dar], sr)
+    for _ in range(2):
+        if lufs_render > -69.0:
+            gain_db = target_lufs - lufs_render
+            final_sig = final_sig * (10.0 ** (gain_db / 20.0))
+        final_sig, gr_db = apply_peak_limiter(final_sig, sr, ceiling_db=-1.0, attack_ms=5.0, release_ms=80.0, return_stats=True)
+        limiter_max_gr_db = max(limiter_max_gr_db, float(gr_db))
+        lufs_render = integrated_lufs(final_sig[:dar], sr)
+        if abs(lufs_render - target_lufs) <= 0.3:
+            break
+
+    # Measure natural tail decay BEFORE applying the final 1.0s fade-out
+    target_end_samples = int(round((orig_sound_end + 1.5) * sr))
+    if len(final_sig) > target_end_samples:
+        final_sig = final_sig[:target_end_samples].copy()
+    pre_fade_sound_end = detect_sound_end(final_sig, sr, floor_db=-60.0)
+    decay_rend = estimate_decay_rate(
+        final_sig, sr, last_note_on + 0.2, min(pre_fade_sound_end, orig_sound_end + 0.5), band=(400.0, 1500.0)
+    )
+    decay_rate_render_db_s = float(decay_rend[0]) if decay_rend is not None else None
+
+    # Apply 1.0s fade-out at the end (orig_sound_end + 0.5s .. + 1.5s)
+    fade_len = min(len(final_sig), int(round(1.0 * sr)))
+    if fade_len > 1:
+        final_sig[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)[:, None]
+
+    peak_dbfs = float(20.0 * np.log10(max(float(np.max(np.abs(final_sig))), 1e-12))) if len(final_sig) else -120.0
+    sound_end_render = detect_sound_end(final_sig, sr, floor_db=-60.0)
 
     full_wav = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.wav"
     full_mp3 = out_dir / f"{args.song_name}_Full_Calibrated_Salamander.mp3"
@@ -678,10 +778,44 @@ def main() -> None:
     b20_end = int((b20_t_end + 2.5) * sr)
     pv = final_sig[: min(len(final_sig), b20_end)].copy()
     fl = min(len(pv), int(1.5 * sr))
-    pv[-fl:] *= np.linspace(1.0, 0.0, fl)[:, None]
+    if fl > 1:
+        pv[-fl:] *= np.linspace(1.0, 0.0, fl)[:, None]
     sf.write(str(prev_wav), pv, sr, subtype="PCM_24")
+
+    # Write Stage 4 render diagnostics report JSON
+    rh_vels = [int(n.get("calc_vel", 64)) for n in notes if int(n.get("staff", 1)) == 1]
+    lh_vels = [int(n.get("calc_vel", 64)) for n in notes if int(n.get("staff", 1)) == 2]
+    c5_vels = [int(n.get("calc_vel", 64)) for n in notes if int(n["pitch"]) == 72]
+    report = {
+        "vel_max_rh": max(rh_vels) if rh_vels else 0,
+        "vel_max_lh": max(lh_vels) if lh_vels else 0,
+        "n_vel_ge_110": sum(1 for n in notes if int(n.get("calc_vel", 64)) >= 110),
+        "c5_vel_median": float(np.median(c5_vels)) if c5_vels else None,
+        "c5_vel_max": max(c5_vels) if c5_vels else None,
+        "closed_loop_adjusted": int(adj_cnt),
+        "closed_loop_med_err_db": round(float(med_err_db), 3),
+        "lufs_orig": round(float(lufs_orig), 3),
+        "lufs_render": round(float(lufs_render), 3),
+        "peak_dbfs": round(float(peak_dbfs), 3),
+        "limiter_max_gr_db": round(float(limiter_max_gr_db), 3),
+        "sound_end_orig": round(float(orig_sound_end), 3),
+        "sound_end_render": round(float(sound_end_render), 3),
+        "pedal_release_t": round(float(pedal_release_t), 3),
+        "eq_bands_hz": eq_bands_hz,
+        "eq_gains_db": eq_gains_db_list,
+        "soft_ratio": round(float(soft_ratio), 4),
+        "eq_strength": round(float(eq_strength), 3),
+        "rt60_est": round(float(rt60_est), 3) if rt60_est is not None else None,
+        "rt60_used": round(float(rt60_used), 3),
+        "reverb_wet": round(float(reverb_wet), 4),
+        "decay_rate_orig_db_s": round(float(decay_rate_orig_db_s), 3) if decay_rate_orig_db_s is not None else None,
+        "decay_rate_render_db_s": round(float(decay_rate_render_db_s), 3) if decay_rate_render_db_s is not None else None,
+    }
+    report_path = out_dir / f"{args.song_name}_stage4_render_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
     mp3_note = f", {mp3_out.name}" if mp3_out else ""
-    print(f"Stage 4 Render Complete: {full_wav.name}{mp3_note}, {prev_wav.name}, {mid_out.name}")
+    print(f"Stage 4 Render Complete: {full_wav.name}{mp3_note}, {prev_wav.name}, {mid_out.name}, {report_path.name}")
 
 
 if __name__ == "__main__":
