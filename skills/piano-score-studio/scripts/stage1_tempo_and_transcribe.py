@@ -23,6 +23,7 @@ import soundfile as sf
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stage0_audio_triage import detect_first_note_sec
 from tempo_map import TempoMap
 from transcription_engines import (
     quantize_performance_midi,
@@ -119,15 +120,7 @@ def load_audio_mono(audio_path: Path) -> tuple[np.ndarray, int]:
 def extract_onset_features(mono: np.ndarray, sr: int) -> dict[str, np.ndarray | float]:
     """Compute 10 ms spectral onset flux (full + bass + chroma change) and first active note time."""
     hop_10ms = max(1, int(round(sr * 0.01)))
-    nf_rms = len(mono) // hop_10ms
-    if nf_rms > 0:
-        rms_db = 10.0 * np.log10(
-            np.mean(mono[: nf_rms * hop_10ms].reshape(nf_rms, hop_10ms) ** 2, axis=1) + 1e-15
-        )
-        above = np.where(rms_db > -35.0)[0]
-        first_note_sec = float(above[0] * 0.01) if len(above) else float(len(mono) / sr)
-    else:
-        first_note_sec = 0.0
+    first_note_sec = detect_first_note_sec(mono, sr)
 
     n_fft = 2048
     nf = (len(mono) - n_fft) // hop_10ms + 1
@@ -968,6 +961,7 @@ def main() -> None:
             "first_downbeat": first_downbeat,
             "pickup_sec": meter_info["pickup_sec"],
             "has_pickup": bool(meter_info["pickup_sec"] > 0.05),
+            "bar1_offset_quarters": 0.0,
             "circular_R": bpm_info["circular_R"],
             "max_abs_drift_ms": bpm_info["max_abs_drift_ms"],
             "tempo_mode": bpm_info["tempo_mode"],
@@ -1007,6 +1001,19 @@ def main() -> None:
                 weight_path=args.model,
             )
             note_onsets = np.asarray([n["start_sec"] for n in tk_notes], dtype=np.float64)
+            # P0-2 guard: never leave notes more than 1 bar before first_downbeat
+            if len(note_onsets) > 0:
+                min_note_t = float(np.min(note_onsets))
+                bar_s_approx = beats_per_bar_quarter * (60.0 / max(1e-6, quarter_bpm))
+                if min_note_t < first_downbeat - bar_s_approx * 1.05:
+                    shift_bars = int(math.floor((first_downbeat - min_note_t) / bar_s_approx))
+                    new_fd = max(0.0, first_downbeat - shift_bars * bar_s_approx)
+                    if len(quarter_beats) >= 2:
+                        k_new = int(np.argmin(np.abs(quarter_beats - new_fd)))
+                        new_fd = float(quarter_beats[k_new])
+                    first_downbeat = round(new_fd, 4)
+                    report["calibration"]["first_downbeat"] = first_downbeat
+                    report["tempo_map"]["first_downbeat"] = first_downbeat
             k0 = int(np.argmin(np.abs(quarter_beats - first_downbeat))) if len(quarter_beats) else 0
             q_arr = (np.arange(len(quarter_beats), dtype=np.float64) - float(k0)) if len(quarter_beats) >= 2 else None
             tmap_s1 = TempoMap(
@@ -1036,6 +1043,7 @@ def main() -> None:
                 trim_leading_bars=True,
             )
             report["calibration"]["has_pickup"] = bool(q_res["has_pickup"])
+            report["calibration"]["bar1_offset_quarters"] = float(q_res.get("bar1_offset_quarters", 0.0))
             tr_out = {
                 "note_onset_count": int(len(note_onsets)),
                 "grid_refined": grid_refined,
